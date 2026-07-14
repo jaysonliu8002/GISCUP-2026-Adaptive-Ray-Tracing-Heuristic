@@ -1,0 +1,11 @@
+# generated / heavy artifacts
+cache/
+submission/
+__pycache__/
+*.pyc
+*.log
+
+# environments and local tool settings
+.venv/
+.claude/
+.vscode/
