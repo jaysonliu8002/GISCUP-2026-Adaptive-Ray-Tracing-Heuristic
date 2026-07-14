@@ -2,7 +2,7 @@
 
 **IMPORTANT**
 
-Program is currently in experimental phase
+Program is currently in experimental phase.
 Use the "\_test" files instead of the "\_giscup"
 
 ---
@@ -13,6 +13,20 @@ interact. Crop benchmarks below refer to two cutouts of the sample dataset:
 **crop1** (605 buildings / 2,945 candidates) and **crop2** (1,855 / 10,168).
 The full sample dataset is 12,860 buildings / 78,727 candidates.
 
+Relavant switches to change:
+
+| switch                  |
+| ----------------------- |
+| `SOLVE_RADIUS`          |
+| `ADAPTIVE_DOUBLINGS`    |
+| `VALIDATION_STEP`       |
+| `LOOKAHEAD_BEAM`        |
+| `LOOKAHEAD_DEPTH`       |
+| `REFINE_MAX_ITERATIONS` |
+| `REFINE_TIME_BUDGET`    |
+| `VANTAGE_SEED_PERCENT`  |
+| `VANTAGE_RADIUS`        |
+
 ---
 
 ## Problem
@@ -22,6 +36,8 @@ The full sample dataset is 12,860 buildings / 78,727 candidates.
 | `TAUS`, `KS`      | the 9 subcases (τ × k) the contest scores |
 | `GEOJSON_PATH`    | input dataset                             |
 | `SUBMISSION_PATH` | output file                               |
+
+Visit [GISCUP](https://sigspatial2026.sigspatial.org/giscup.html) for more information
 
 ---
 
@@ -233,13 +249,13 @@ graph build.
 
 ## Performance quick reference (full sample dataset, measured)
 
-| stage                           | cost                                                                  |
-| ------------------------------- | --------------------------------------------------------------------- |
-| precompute, plain r=160         | ~36 min single-core (÷ processes)                                     |
-| precompute, +1 doubling (→320)  | ~48 min single-core                                                   |
-| precompute, +2 doublings (→640) | ~77 min single-core                                                   |
-| shared `extraLen` table         | ~10 s, once per solve()                                               |
-| greedy (incremental engine)     | 4.7–11.2× faster than the old rescan version, bit-identical sequences |
-| lookahead depth 2 / 3           | ~2.3× / ~15× plain greedy per τ                                       |
-| refine                          | neighborhood-bounded per swap + per-subcase time budget               |
+| stage                           | cost                                                                        |
+| ------------------------------- | --------------------------------------------------------------------------- |
+| precompute, plain r=160         | ~36 min single-core (÷ processes)                                           |
+| precompute, +1 doubling (→320)  | ~48 min single-core                                                         |
+| precompute, +2 doublings (→640) | ~77 min single-core                                                         |
+| shared `extraLen` table         | ~10 s, once per solve()                                                     |
+| greedy (incremental engine)     | 4.7–11.2× faster than the old rescan version, bit-identical sequences       |
+| lookahead depth 2 / 3           | ~2.3× / ~15× plain greedy per τ                                             |
+| refine                          | neighborhood-bounded per swap + per-subcase time budget                     |
 | validation                      | k antennas only; adaptive re-sweep one VALIDATION_STEP past the claim reach |
