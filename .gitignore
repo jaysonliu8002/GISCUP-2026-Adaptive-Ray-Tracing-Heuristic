@@ -2,6 +2,7 @@
 cache/
 submission/
 __pycache__/
+test/
 *.pyc
 *.log
 

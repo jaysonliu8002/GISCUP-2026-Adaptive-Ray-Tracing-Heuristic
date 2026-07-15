@@ -1,5 +1,5 @@
 """
-run_test.py — compute, validate, and plot for the GIS Cup 2026 solver.
+run_giscup.py — compute, validate, and plot for the GIS Cup 2026 solver.
  
 All reusable functions live in giscup_lib.py; this file is just the driver.
 Run the sections in order (or as notebook cells). Each section is self-contained
@@ -11,7 +11,7 @@ with `if __name__ == "__main__":` (done below). In Jupyter, parallel=True works
 because the workers import the installed giscup_lib module.
 """
  
-from lib_test import (
+from lib_giscup import (
     greedyCornersCached,
     loadGeoJSON, loadOrBuildViewsheds, servicedIdsFromViewCache, writeSubmission, parseSubmission,
     greedyLookahead, buildExtraLen,
@@ -19,9 +19,15 @@ from lib_test import (
     normalizePolygon, pointOnEdge, computeConvexity, SpatialGrid,
     plt, MplPolygon,
 )
-from centrality_test import buildVisibilityGraphRadiusBVH, topKVantageVertices
+from centrality_giscup import buildVisibilityGraphRadiusBVH, topKVantageVertices
 from datetime import datetime
+import os
 import time
+
+# Data files (dataset, cache/, submission/) live at the repo root, one level
+# above this script's folder, so anchor paths there instead of relying on the
+# current working directory.
+REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 # ---------------------------------------------------------------------------
 # Config -- every switch is documented in README.md, including the
@@ -31,7 +37,7 @@ import time
 # -- problem ----------------------------------------------------------------
 TAUS = [0.25, 0.5, 0.75]
 KS   = [50, 500, 1000]
-GEOJSON_PATH = "GIS-cup-sample-dataset.geojson"
+GEOJSON_PATH = os.path.join(REPO_ROOT, "GIS-cup-sample-dataset.geojson")
 
 # -- radii / viewshed reach --------------------------------------------------
 SOLVE_RADIUS       = 80.0
@@ -64,7 +70,7 @@ VANTAGE_RADIUS        = 320.0
 VANTAGE_NODE_CAPACITY = 25
 VANTAGE_PROCESSES     = None               # None -> os.cpu_count()
 
-SUBMISSION_PATH = "submission/submission_1.txt"
+SUBMISSION_PATH = os.path.join(REPO_ROOT, "submission", "submission_2.txt")
 
 # ===========================================================================
 #  SHARED VALIDATION HELPER  (used by validate() and solve() so both
@@ -231,7 +237,7 @@ def _pickVantageSeeds(polygons, convexity, n=0, radius=VANTAGE_RADIUS,
         if verbose:
             print("Vantage seeds: n=0 requested, skipping (plain greedy).")
         return []
-    from lib_test import candidateList   # was `from lib_giscup import` -- broken name
+    from lib_giscup import candidateList   # was `from lib_giscup import` -- broken name
     candidates = candidateList(polygons)
     adjacency = buildVisibilityGraphRadiusBVH(polygons, candidates, radius=radius,
                                               node_capacity=nodeCapacity,
@@ -325,9 +331,10 @@ def solve(seed=0):
         "loadOrBuildViewsheds", loadOrBuildViewsheds,
         polygons, radius=SOLVE_RADIUS, gridCell=SOLVE_GRIDCELL,
         maxRadius=_adaptiveMax(),
-        path=(f"cache/viewcache_r{int(SOLVE_RADIUS)}"
-              + (f"_d{ADAPTIVE_DOUBLINGS}" if _adaptiveMax() else "")
-              + ".pkl"))
+        path=os.path.join(REPO_ROOT, "cache",
+                          f"viewcache_r{int(SOLVE_RADIUS)}"
+                          + (f"_d{ADAPTIVE_DOUBLINGS}" if _adaptiveMax() else "")
+                          + ".pkl"))
 
     _EXTRA_LEN["v"] = _timed("buildExtraLen (shared by greedy/lookahead/refine)",
                              buildExtraLen, candidates, viewCache)
@@ -583,7 +590,7 @@ def averageBuildingDistance(sampleCap=None):
     return mean, med, min(dists), max(dists)
 
 
-def plotDataset(outPath="dataset.png"):
+def plotDataset(outPath=os.path.join(REPO_ROOT, "dataset.png")):
     """
     Plot the raw dataset (every building footprint) with a scale bar.
     Saves to outPath and returns it.

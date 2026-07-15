@@ -2,16 +2,16 @@
 
 **IMPORTANT**
 
-Program is currently in experimental phase.
-Use the "\_test" files instead of the "\_giscup"
-
 ---
 
-All switches live at the top of `run_giscup.py`. This file holds the prose:
+All switches live at the top of `main/run_giscup.py` (experimental variants
+in `test/`). This file holds the prose:
 what each one does, the measurements behind its default, and how the pieces
 interact. Crop benchmarks below refer to two cutouts of the sample dataset:
 **crop1** (605 buildings / 2,945 candidates) and **crop2** (1,855 / 10,168).
 The full sample dataset is 12,860 buildings / 78,727 candidates.
+
+Use `run_giscup.py` to run the program
 
 Relavant switches to change:
 
