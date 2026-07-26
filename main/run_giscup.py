@@ -70,7 +70,25 @@ VANTAGE_RADIUS        = 320.0
 VANTAGE_NODE_CAPACITY = 25
 VANTAGE_PROCESSES     = None               # None -> os.cpu_count()
 
-SUBMISSION_PATH = os.path.join(REPO_ROOT, "submission", "submission_2.txt")
+SUBMISSION_DIR = os.path.join(REPO_ROOT, "submission")
+
+def _submissionPath(n):
+    return os.path.join(SUBMISSION_DIR, f"submission_{n}.txt")
+
+def nextSubmissionPath():
+    """First submission_N.txt (N = 1, 2, ...) that doesn't exist yet, so a
+    new solve never overwrites an earlier submission."""
+    n = 1
+    while os.path.exists(_submissionPath(n)):
+        n += 1
+    return _submissionPath(n)
+
+def latestSubmissionPath():
+    """Highest-numbered existing submission_N.txt, or None if there are none."""
+    n = 1
+    while os.path.exists(_submissionPath(n)):
+        n += 1
+    return _submissionPath(n - 1) if n > 1 else None
 
 # ===========================================================================
 #  SHARED VALIDATION HELPER  (used by validate() and solve() so both
@@ -526,17 +544,18 @@ def solve(seed=0):
             _log(f"tau={tau} done ({time.perf_counter() - tauStart:.1f}s)")
         _printSummaryTable(summaryRows)
 
-    writeSubmission(SUBMISSION_PATH, results)
+    outPath = nextSubmissionPath()
+    writeSubmission(outPath, results)
     _log("All subcases passed their checks." if allOk
          else "SOME SUBCASES HAD PROBLEMS -- see FAIL lines above.")
     if skipRecheck:
         reach = max(SOLVE_RADIUS, _adaptiveMax() or 0)
-        _log(f"Wrote {SUBMISSION_PATH} (coverage recheck SKIPPED -- the re-sweep "
+        _log(f"Wrote {outPath} (coverage recheck SKIPPED -- the re-sweep "
              f"reach {int(_validationMax())} does not exceed the claim reach "
              f"{int(reach)}; raise VALIDATION_STEP above 1 to independently "
              f"re-check and harvest).")
     else:
-        _log(f"Wrote {SUBMISSION_PATH} (independently re-swept at reach "
+        _log(f"Wrote {outPath} (independently re-swept at reach "
              f"{int(_validationMax())} per subcase).")
     _log(f"solve() total: {time.perf_counter() - solveStart:.2f}s")
  
@@ -636,7 +655,9 @@ def plotDataset(outPath=os.path.join(REPO_ROOT, "dataset.png")):
 def plot(usePath=None):
     plotStart = time.perf_counter()
     if usePath is None:
-        usePath = SUBMISSION_PATH
+        usePath = latestSubmissionPath()
+        if usePath is None:
+            raise FileNotFoundError(f"no submission_N.txt files in {SUBMISSION_DIR}")
     polygons, ids = loadGeoJSON(GEOJSON_PATH)
     subs = parseSubmission(usePath)
  
@@ -701,9 +722,5 @@ if __name__ == "__main__":
 
     solve()
     print(f"Solved: {datetime.now()}")
-
-    # plotDataset()
-    # plot(SUBMISSION_PATH)
-    # print(f"Plotted: {datetime.now()}")
 
     print(f"[__main__ total] took {time.perf_counter() - mainStart:.2f}s")
