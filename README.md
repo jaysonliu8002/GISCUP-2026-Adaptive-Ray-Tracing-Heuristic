@@ -1,8 +1,10 @@
 # GIS Cup 2026 solver — configuration reference
 
-**IMPORTANT**
+**Last updated 7/26/2026 4:40 PM EST**
 
----
+Added file submission protection. Re-runs no longer override submissions.
+
+**IMPORTANT**
 
 All switches live at the top of `main/run_giscup.py` (experimental variants
 in `test/`). This file holds the prose:
