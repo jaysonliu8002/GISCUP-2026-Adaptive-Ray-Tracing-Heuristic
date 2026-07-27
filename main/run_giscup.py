@@ -17,9 +17,14 @@ from lib_giscup import (
     greedyLookahead, buildExtraLen,
     localEvalCoverParallel, refineWithSwapsV2, buildBoundaryChecker,
     normalizePolygon, pointOnEdge, computeConvexity, SpatialGrid,
-    plt, MplPolygon,
+    loadOrBuildPackedViewshed, extraLenFromPacked, baseCovFromPacked,
+    buildBuildingToCandidates, buildRefineParallelContext,
 )
-from centrality_giscup import buildVisibilityGraphRadiusBVH, topKVantageVertices
+# matplotlib is imported INSIDE the plotting functions, never at module
+# scope: multiprocessing spawn re-imports this file in every worker, so a
+# module-level matplotlib import would charge ~1s of startup to each of the
+# hundreds of workers a solve creates -- none of which plot anything.
+from centrality_giscup import loadOrPickVantageSeeds
 from datetime import datetime
 import os
 import time
@@ -55,9 +60,18 @@ LOOKAHEAD_DEPTH        = 2                 # used when the gradient is None
 
 # -- refinement ---------------------------------------------------------------
 REFINE_WITH_SWAPS     = True
-REFINE_MAX_ITERATIONS = 100                # cap on COMMITTED swaps
+REFINE_MAX_ITERATIONS = 1000                # cap on COMMITTED swaps
 REFINE_TIME_BUDGET    = 3600                # seconds per subcase; None = unlimited
 REFINE_VERBOSE        = True
+REFINE_PROCESSES      = None               # workers for the parallel swap-scan
+                                           # (mmap'd packed viewshed, see README);
+                                           # None -> os.cpu_count(), 0 = serial
+
+# -- crash safety --------------------------------------------------------------
+RESUME_PARTIAL_SUBMISSION = True           # a partially-written submission_N.txt
+                                           # (crash mid-solve) is continued, not
+                                           # restarted; complete files stay
+                                           # protected as before
 
 # -- validation ---------------------------------------------------------------
 SKIP_REDUNDANT_VALIDATION = True
@@ -89,6 +103,37 @@ def latestSubmissionPath():
     while os.path.exists(_submissionPath(n)):
         n += 1
     return _submissionPath(n - 1) if n > 1 else None
+
+def _resumableSubmission():
+    """
+    Where this solve should write, and which subcases are already done.
+
+    If the LATEST submission_N.txt holds a strict subset of this run's
+    (tau, k) grid -- i.e. a previous solve crashed or was interrupted
+    after writing some but not all subcases -- resume it: reuse its
+    finished subcases verbatim and keep writing to the same file.
+    Anything else (no file, a complete file, a file whose subcases don't
+    match the current TAUS/KS config, an unparseable file) starts a fresh
+    numbered file, so complete submissions stay protected exactly as
+    before.
+
+    Returns (outPath, doneResults) with doneResults in writeSubmission's
+    format.
+    """
+    expected = {(t, k) for t in TAUS for k in KS}
+    path = latestSubmissionPath()
+    if not RESUME_PARTIAL_SUBMISSION or path is None:
+        return nextSubmissionPath(), []
+    try:
+        subs = parseSubmission(path)
+    except Exception:
+        return nextSubmissionPath(), []
+    keys = [(s["tau"], s["k"]) for s in subs]
+    if len(keys) == len(set(keys)) and 0 < len(keys) and set(keys) < expected:
+        done = [{"tau": s["tau"], "k": s["k"], "antennas": s["antennas"],
+                 "servicedIds": s["claimedIds"]} for s in subs]
+        return path, done
+    return nextSubmissionPath(), []
 
 # ===========================================================================
 #  SHARED VALIDATION HELPER  (used by validate() and solve() so both
@@ -257,20 +302,35 @@ def _pickVantageSeeds(polygons, convexity, n=0, radius=VANTAGE_RADIUS,
         return []
     from lib_giscup import candidateList   # was `from lib_giscup import` -- broken name
     candidates = candidateList(polygons)
-    adjacency = buildVisibilityGraphRadiusBVH(polygons, candidates, radius=radius,
-                                              node_capacity=nodeCapacity,
-                                              processes=processes, verbose=verbose)
-    top = topKVantageVertices(adjacency, k=n, convexity=convexity)
+    # Cached and crash-safe: the graph build behind these seeds is the
+    # longest single stage in the pipeline (~22 min at radius 640), so it
+    # checkpoints as it goes and both it and the picked seeds persist to
+    # cache/. A re-run with the same settings loads the seeds outright; a
+    # re-run with a different seed count reuses the graph; a run resumed
+    # after a crash mid-build picks up from the checkpoint.
+    tag = f"r{int(radius)}_nc{int(nodeCapacity)}"
+    top = loadOrPickVantageSeeds(
+        polygons, candidates, n=n, radius=radius, nodeCapacity=nodeCapacity,
+        convexity=convexity, processes=processes, verbose=verbose,
+        seedsPath=os.path.join(REPO_ROOT, "cache", f"vantage_seeds_{tag}_n{n}.pkl"),
+        graphPath=os.path.join(REPO_ROOT, "cache", f"vantage_graph_{tag}.pkl"))
     if verbose:
         print(f"Vantage seeds ({len(top)}/{n} requested):")
         for v, deg in top:
             print(f"    {v}  (visibility-graph degree at selection: {deg})")
     return [v for v, _deg in top]
 
-# extraLen is a static per-(candidate, building) table derived only from
-# the viewshed cache; every tau/k subcase reuses the exact same one, so
-# solve() builds it once and greedy/lookahead/refine all share it here.
+# Static, cache-derived tables shared by every tau/k subcase -- solve()
+# builds them once (from the packed viewshed arrays, see README) and
+# greedy/lookahead/refine all read them from here:
+#   "v"        (in _EXTRA_LEN) : per-(candidate, building) unmerged-length
+#                                upper bound (buildExtraLen equivalent)
+#   "baseCov"  : per-(candidate, building) merged standalone coverage
+#   "btc"      : building -> candidates-that-see-it index
+#   "refineCtx": mmap'd packed arrays + index maps for the PARALLEL
+#                refine swap-scan (None/absent -> refine runs serial)
 _EXTRA_LEN = {}
+_SHARED = {}
 
 def _runGreedy(polygons, kTarget, tau, candidates, viewCache, seed, convexity, seedVertices):
     """
@@ -285,11 +345,13 @@ def _runGreedy(polygons, kTarget, tau, candidates, viewCache, seed, convexity, s
             polygons, kTarget, tau, candidates, viewCache,
             beamWidth=LOOKAHEAD_BEAM, depth=_lookaheadDepth(tau),
             seed=seed, convexity=convexity,
-            seedVertices=seedVertices, extraLen=_EXTRA_LEN.get("v"))
+            seedVertices=seedVertices, extraLen=_EXTRA_LEN.get("v"),
+            baseCov=_SHARED.get("baseCov"), buildingToCands=_SHARED.get("btc"))
     return greedyCornersCached(
         polygons, kTarget, tau, candidates, viewCache,
         seed=seed, convexity=convexity, seedVertices=seedVertices,
-        extraLen=_EXTRA_LEN.get("v"))
+        extraLen=_EXTRA_LEN.get("v"),
+        baseCov=_SHARED.get("baseCov"), buildingToCands=_SHARED.get("btc"))
 
 def _runRefine(polygons, placed, tau, candidates, viewCache):
     """
@@ -305,7 +367,9 @@ def _runRefine(polygons, placed, tau, candidates, viewCache):
     newPlaced, _served, nSwaps, finalVC = refineWithSwapsV2(
         polygons, placed, tau, candidates, viewCache,
         maxIterations=REFINE_MAX_ITERATIONS, verbose=REFINE_VERBOSE,
-        timeBudget=REFINE_TIME_BUDGET, extraLen=_EXTRA_LEN.get("v"))
+        timeBudget=REFINE_TIME_BUDGET, extraLen=_EXTRA_LEN.get("v"),
+        buildingToCands=_SHARED.get("btc"),
+        parallelCtx=_SHARED.get("refineCtx"))
     return newPlaced, nSwaps, finalVC
 
 # ===========================================================================
@@ -344,18 +408,35 @@ def solve(seed=0):
     idToIndex = {bid: i for i, bid in enumerate(ids)}
     onAnyBoundary = _timed("_buildBoundaryChecker", _buildBoundaryChecker, polygons)
 
-    # build once or load from disk
+    # build once or load from disk (the precompute checkpoints itself to a
+    # .partial file every few minutes and resumes from it after a crash;
+    # the finished cache is saved to disk BEFORE any solving starts)
+    cacheBase = os.path.join(REPO_ROOT, "cache",
+                             f"viewcache_r{int(SOLVE_RADIUS)}"
+                             + (f"_d{ADAPTIVE_DOUBLINGS}" if _adaptiveMax() else ""))
     candidates, viewCache, perim = _timed(
         "loadOrBuildViewsheds", loadOrBuildViewsheds,
         polygons, radius=SOLVE_RADIUS, gridCell=SOLVE_GRIDCELL,
-        maxRadius=_adaptiveMax(),
-        path=os.path.join(REPO_ROOT, "cache",
-                          f"viewcache_r{int(SOLVE_RADIUS)}"
-                          + (f"_d{ADAPTIVE_DOUBLINGS}" if _adaptiveMax() else "")
-                          + ".pkl"))
+        maxRadius=_adaptiveMax(), path=cacheBase + ".pkl")
 
-    _EXTRA_LEN["v"] = _timed("buildExtraLen (shared by greedy/lookahead/refine)",
-                             buildExtraLen, candidates, viewCache)
+    # Packed numpy mirror of the cache (built once, then loaded mmap'd):
+    # feeds the parallel refine workers AND yields the shared per-
+    # (candidate, building) tables below as vectorized array reads.
+    packed = _timed("loadOrBuildPackedViewshed", loadOrBuildPackedViewshed,
+                    cacheBase + "_packed", candidates, viewCache, perim, polygons)
+    _EXTRA_LEN["v"] = _timed("extraLenFromPacked (shared by greedy/lookahead/refine)",
+                             extraLenFromPacked, candidates, packed)
+    _SHARED["baseCov"] = _timed("baseCovFromPacked (shared standalone coverages)",
+                                baseCovFromPacked, candidates, packed)
+    _SHARED["btc"] = _timed("buildBuildingToCandidates (shared index)",
+                            buildBuildingToCandidates, candidates, viewCache)
+    if REFINE_WITH_SWAPS and (REFINE_PROCESSES is None or REFINE_PROCESSES > 0):
+        _SHARED["refineCtx"] = _timed(
+            "buildRefineParallelContext (parallel swap-scan)",
+            buildRefineParallelContext, candidates, cacheBase + "_packed",
+            REFINE_PROCESSES)
+    else:
+        _SHARED.pop("refineCtx", None)
 
     results = []
     allOk = True
@@ -363,6 +444,19 @@ def solve(seed=0):
     # config-static: whether the independent coverage re-sweep will run at
     # all this run -- used both to skip it and to log HONESTLY about it
     skipRecheck = _shouldSkipCoverageRecheck()
+
+    # Crash safety: pick (or resume) the output file NOW and rewrite it
+    # after every verified subcase, so an interruption at any point keeps
+    # everything finished so far and the next run continues from there.
+    outPath, doneResults = _resumableSubmission()
+    doneKeys = {(r["tau"], r["k"]) for r in doneResults}
+    if doneResults:
+        _log(f"Resuming partial {os.path.basename(outPath)}: "
+             f"{sorted(doneKeys)} already done, skipping those subcases")
+
+    def _flushSubmission():
+        writeSubmission(outPath, sorted(doneResults + results,
+                                        key=lambda r: (r["tau"], r["k"])))
 
     # Corner convexity: a cheap, purely geometric tiebreak (prefer sharper
     # outward corners over near-straight or reflex ones) applied ONLY when
@@ -407,6 +501,10 @@ def solve(seed=0):
         summaryRows = []
         for tau in TAUS:
             tauStart = time.perf_counter()
+            if all((tau, k) in doneKeys for k in KS):
+                _log(f"tau={tau}: every subcase resumed from file, "
+                     f"skipping the greedy entirely")
+                continue
             # Search at the SAME threshold claims are filtered at: the sample
             # data is full of rectangles where an antenna sees exactly two of
             # four sides -- coverage lands at tau + ~1e-7 at tau=0.5. At bare
@@ -423,6 +521,13 @@ def solve(seed=0):
             coverageState = None
             prevK = 0
             for k in sorted(KS):
+                if (tau, k) in doneKeys:
+                    # resumed from the partial file; prevK/coverageState are
+                    # deliberately NOT advanced, so the incremental branch
+                    # below still processes placedFull[prevK:k] correctly
+                    # for the next non-skipped k
+                    _log(f"tau={tau}, k={k}: resumed from file, skipped")
+                    continue
                 start_time = time.perf_counter()
 
                 if REFINE_WITH_SWAPS:
@@ -453,6 +558,7 @@ def solve(seed=0):
                     skipCoverageRecheck=skipRecheck)
                 allOk = allOk and ok
                 results.append(verifiedResult)
+                _flushSubmission()   # crash-safe: this subcase is on disk now
 
                 dt = time.perf_counter() - start_time
                 nVerified = len(verifiedResult['servicedIds'])
@@ -492,6 +598,9 @@ def solve(seed=0):
             # same search-at-margined-threshold reasoning as the fast path
             tauEff = tau + CLAIM_MARGIN
             for k in sorted(KS):
+                if (tau, k) in doneKeys:
+                    _log(f"tau={tau}, k={k}: resumed from file, skipped")
+                    continue
                 start_time = time.perf_counter()
                 # Truncation (int()) can round a small percentage of a small
                 # k down to 0, silently disabling seeding for that specific
@@ -524,6 +633,7 @@ def solve(seed=0):
                     skipCoverageRecheck=skipRecheck)
                 allOk = allOk and ok
                 results.append(verifiedResult)
+                _flushSubmission()   # crash-safe: this subcase is on disk now
 
                 dt = time.perf_counter() - start_time
                 nVerified = len(verifiedResult['servicedIds'])
@@ -544,8 +654,7 @@ def solve(seed=0):
             _log(f"tau={tau} done ({time.perf_counter() - tauStart:.1f}s)")
         _printSummaryTable(summaryRows)
 
-    outPath = nextSubmissionPath()
-    writeSubmission(outPath, results)
+    _flushSubmission()   # already written per-subcase; final write for safety
     _log("All subcases passed their checks." if allOk
          else "SOME SUBCASES HAD PROBLEMS -- see FAIL lines above.")
     if skipRecheck:
@@ -614,6 +723,7 @@ def plotDataset(outPath=os.path.join(REPO_ROOT, "dataset.png")):
     Plot the raw dataset (every building footprint) with a scale bar.
     Saves to outPath and returns it.
     """
+    import matplotlib.pyplot as plt
     from matplotlib.collections import PolyCollection
     polygons, ids = loadGeoJSON(GEOJSON_PATH)
     allX = [v[0] for p in polygons for v in p]
@@ -653,6 +763,7 @@ def plotDataset(outPath=os.path.join(REPO_ROOT, "dataset.png")):
 
 
 def plot(usePath=None):
+    import matplotlib.pyplot as plt
     plotStart = time.perf_counter()
     if usePath is None:
         usePath = latestSubmissionPath()

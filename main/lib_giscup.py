@@ -23,8 +23,25 @@ import os
 import time
 import numpy as np
 from collections import defaultdict
-import matplotlib.pyplot as plt
-from matplotlib.patches import Polygon as MplPolygon
+
+# matplotlib is NOT imported at module scope, and must not be: on Windows
+# every multiprocessing worker re-imports this module at spawn, and a solve
+# creates ~19 pools (precompute + one validation and one refine pool per
+# subcase) x os.cpu_count() workers. Importing matplotlib.pyplot costs ~1.0s
+# per worker on top of numpy's 0.49s -- pure startup tax paid by processes
+# that only ever run geometry. Nothing in this module actually draws, so the
+# names below are re-exported lazily (PEP 562) purely so existing callers'
+# `from lib_giscup import plt` keeps working; the import happens on first
+# attribute access, i.e. only in a process that really plots.
+
+def __getattr__(name):
+    if name == "plt":
+        import matplotlib.pyplot as plt
+        return plt
+    if name == "MplPolygon":
+        from matplotlib.patches import Polygon as MplPolygon
+        return MplPolygon
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
 # ===========================================================================
@@ -129,15 +146,30 @@ def writeSubmission(path, results):
         (tau, k)
         (x1, y1), (x2, y2), ...
         id1, id2, ...
+
+    Crash-safe: writes to a sibling temp file and os.replace()s it into
+    place, so a crash mid-write can never leave a truncated submission --
+    the previous version (if any) survives intact. This matters now that
+    solve() rewrites the submission after EVERY subcase.
     """
+    import tempfile
     dirName = os.path.dirname(path)
     if dirName:
         os.makedirs(dirName, exist_ok=True)
-    with open(path, "w") as f:
-        for r in results:
-            f.write(f"({r['tau']!r}, {r['k']})\n")
-            f.write(", ".join(formatCoord(x, y) for x, y in r["antennas"]) + "\n")
-            f.write(", ".join(str(i) for i in r["servicedIds"]) + "\n")
+    fd, tmpPath = tempfile.mkstemp(dir=dirName or ".", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w") as f:
+            for r in results:
+                f.write(f"({r['tau']!r}, {r['k']})\n")
+                f.write(", ".join(formatCoord(x, y) for x, y in r["antennas"]) + "\n")
+                f.write(", ".join(str(i) for i in r["servicedIds"]) + "\n")
+        os.replace(tmpPath, path)
+    except:
+        try:
+            os.unlink(tmpPath)
+        except OSError:
+            pass
+        raise
 # ===========================================================================
 #  VISIBILITY CORE
 # ===========================================================================
@@ -756,8 +788,9 @@ def candidateViewshed(antenna, polygons, grid, radius):
     # dropped (the adaptive path re-solves them against a bigger scene).
     profile, _beyondRadius = sweepAllEdges((ax, ay), allEdges, allVertsEdges,
                                            owner, radius=radius)
-    return {idxs[localPi]: {ei: list(ivs) for ei, ivs in edgeMap.items()}
-            for localPi, edgeMap in profile.items()}
+    return normalizeView(
+        {idxs[localPi]: {ei: list(ivs) for ei, ivs in edgeMap.items()}
+         for localPi, edgeMap in profile.items()})
 def buildExtraLen(candidates, viewCache):
     """Static per-(candidate, building) UNMERGED interval-length totals.
     baseVis + extraLen is a sound upper bound on merged coverage, letting
@@ -786,7 +819,8 @@ class _CoverageState:
     bounded by (touched buildings) x (candidates per building), instead of
     the old full-candidate rescans of every affected candidate."""
 
-    def __init__(self, polygons, tau, candidates, viewCache, extraLen=None):
+    def __init__(self, polygons, tau, candidates, viewCache, extraLen=None,
+                 baseCov=None, buildingToCands=None):
         self.tau = tau
         self.viewCache = viewCache
         self.perim = [polygonPerimeter(p) for p in polygons]
@@ -796,11 +830,30 @@ class _CoverageState:
         self.vis = {}             # b -> committed visible length
         self.servedNow = set()
         self.remaining = set(candidates)
-        self.buildingToCands = defaultdict(set)
-        for c in candidates:
-            for b in viewCache[c]:
-                self.buildingToCands[b].add(c)
+        if buildingToCands is not None:
+            # shared read-only index built once per solve (never mutated here)
+            self.buildingToCands = buildingToCands
+        else:
+            self.buildingToCands = defaultdict(set)
+            for c in candidates:
+                for b in viewCache[c]:
+                    self.buildingToCands[b].add(c)
         self.tips, self.gain, self.score, self.lastCov = {}, {}, {}, {}
+        if baseCov is not None:
+            # tau-independent standalone coverages precomputed once per
+            # cache (baseCovFromPacked) -- no per-subcase interval merging
+            for c in candidates:
+                t = set(); ssum = 0.0
+                bc = baseCov[c]
+                for b, cov in bc.items():
+                    ssum += cov
+                    if cov >= tau:
+                        t.add(b)
+                self.tips[c] = t
+                self.gain[c] = len(t)
+                self.score[c] = ssum
+                self.lastCov[c] = dict(bc)    # copy: commit() mutates it
+            return
         for c in candidates:
             t = set(); ssum = 0.0; lc = {}
             for b, ex in viewCache[c].items():
@@ -873,7 +926,8 @@ class _CoverageState:
 
 
 def greedyCornersCached(polygons, k, tau, candidates, viewCache, seed=0, convexity=None,
-                        seedVertices=None, extraLen=None):
+                        seedVertices=None, extraLen=None, baseCov=None,
+                        buildingToCands=None):
     """
     Lazy single-path greedy: at each step, place the candidate with the
     highest exact gain (buildings pushed to >= tau), tiebroken by convexity
@@ -888,11 +942,15 @@ def greedyCornersCached(polygons, k, tau, candidates, viewCache, seed=0, convexi
                 anything not in `candidates` is silently skipped.
     extraLen  : optional precomputed buildExtraLen(candidates, viewCache);
                 pass it when calling repeatedly on the same cache.
+    baseCov, buildingToCands : optional shared precomputes (see
+                baseCovFromPacked / buildBuildingToCandidates) that make
+                _CoverageState construction cheap on repeated calls.
     """
     rng = random.Random(seed)
     if convexity is None:
         convexity = computeConvexity(polygons)
-    st = _CoverageState(polygons, tau, candidates, viewCache, extraLen)
+    st = _CoverageState(polygons, tau, candidates, viewCache, extraLen,
+                        baseCov=baseCov, buildingToCands=buildingToCands)
     placed = []
 
     def commit(c):
@@ -930,7 +988,8 @@ def greedyCornersCached(polygons, k, tau, candidates, viewCache, seed=0, convexi
 
 def greedyLookahead(polygons, k, tau, candidates, viewCache, beamWidth=6,
                     depth=2, seed=0, convexity=None, seedVertices=None,
-                    extraLen=None, verbose=False, innerBeam=None):
+                    extraLen=None, verbose=False, innerBeam=None,
+                    baseCov=None, buildingToCands=None):
     """
     Beam-lookahead greedy with configurable ply depth: each step scores
     the `beamWidth` most promising candidates as
@@ -956,12 +1015,14 @@ def greedyLookahead(polygons, k, tau, candidates, viewCache, beamWidth=6,
     if depth <= 1:
         return greedyCornersCached(polygons, k, tau, candidates, viewCache,
                                    seed=seed, convexity=convexity,
-                                   seedVertices=seedVertices, extraLen=extraLen)
+                                   seedVertices=seedVertices, extraLen=extraLen,
+                                   baseCov=baseCov, buildingToCands=buildingToCands)
     import heapq
     rng = random.Random(seed)
     if convexity is None:
         convexity = computeConvexity(polygons)
-    st = _CoverageState(polygons, tau, candidates, viewCache, extraLen)
+    st = _CoverageState(polygons, tau, candidates, viewCache, extraLen,
+                        baseCov=baseCov, buildingToCands=buildingToCands)
     perim, viewC = st.perim, st.viewCache
     extraLen = st.extraLen
     gain, score, tips, remaining = st.gain, st.score, st.tips, st.remaining
@@ -1101,6 +1162,11 @@ def _mergeIntervalsIncremental(mergedSorted, newIntervals):
     Returns (updatedMergedSorted, addedLength) — addedLength is the NET new
     visible length contributed by newIntervals (only the previously-uncovered
     part), not the raw sum of newIntervals' lengths.
+
+    Use this when you need the merged LIST back. When only addedLength is
+    wanted (the overwhelmingly common case -- see _covWithExtra), call
+    _addedLengthNorm instead: it skips building the list and re-summing the
+    baseline, which measured 3.7x faster on real cache intervals.
     """
     if not newIntervals:
         return mergedSorted, 0.0
@@ -1115,6 +1181,107 @@ def _mergeIntervalsIncremental(mergedSorted, newIntervals):
     oldTotal = sum(hi - lo for lo, hi in mergedSorted)
     newTotal = sum(hi - lo for lo, hi in merged)
     return merged, newTotal - oldTotal
+
+
+def _addedLengthNorm(mergedSorted, ivs):
+    """
+    Length of `ivs` NOT already covered by `mergedSorted` -- i.e. exactly
+    the addedLength _mergeIntervalsIncremental returns, without building
+    the merged list or re-summing the baseline.
+
+    REQUIRES both arguments sorted ascending and internally disjoint.
+    `mergedSorted` always is (it is produced by merging). `ivs` always is
+    too, because every viewshed is passed through normalizeView() when it
+    is built and when an older cache is loaded -- see that function for
+    why that invariant is enforced at the source rather than checked here
+    (a per-call sortedness check would cost the very O(n) pass this
+    avoids).
+
+    Measured 3.7x faster than _mergeIntervalsIncremental on real cache
+    intervals, verified identical on 300K randomized cases plus every
+    (candidate, building, edge) list in a full crop cache.
+    """
+    n = len(ivs)
+    if n == 0:
+        return 0.0
+    if not mergedSorted:
+        total = 0.0
+        for lo, hi in ivs:
+            total += hi - lo
+        return total
+    total = 0.0
+    nb = len(mergedSorted)
+    j = 0
+    for curLo, curHi in ivs:
+        lo = curLo
+        # baseline runs entirely left of this interval never matter again
+        while j < nb and mergedSorted[j][1] <= lo:
+            j += 1
+        jj = j
+        while jj < nb:
+            blo, bhi = mergedSorted[jj]
+            if blo >= curHi:
+                break
+            if blo > lo:
+                total += blo - lo
+            if bhi > lo:
+                lo = bhi
+            if lo >= curHi:
+                break
+            jj += 1
+        if lo < curHi:
+            total += curHi - lo
+    return total
+
+
+def normalizeView(view):
+    """
+    Sort and union every edge's interval list in one candidate's viewshed,
+    in place. The intervals a sweep emits are per-wedge fragments -- often
+    adjacent or overlapping (the adaptive corridor passes deliberately
+    produce overlaps at window boundaries), averaging ~11.6 fragments per
+    (building, edge) and already 97.6% sorted.
+
+    Every consumer of a viewshed treats its intervals as a UNION, so
+    collapsing them here changes no result -- it only makes the union
+    explicit, once, instead of re-deriving it on each of the ~23 million
+    coverage checks a solve performs. That is what lets the hot path use
+    _addedLengthNorm. It also shrinks the cache, since merged fragments
+    collapse into fewer tuples.
+    """
+    for edgeMap in view.values():
+        for ei, ivs in edgeMap.items():
+            if len(ivs) == 1:
+                continue
+            merged = []
+            for lo, hi in sorted(ivs):
+                if merged and lo <= merged[-1][1]:
+                    if hi > merged[-1][1]:
+                        merged[-1] = (merged[-1][0], hi)
+                else:
+                    merged.append((lo, hi))
+            edgeMap[ei] = merged
+    return view
+
+
+def normalizeViewCache(viewCache, verbose=True):
+    """normalizeView over a whole cache (used to upgrade a cache built
+    before normalization was introduced). Returns the interval count
+    before and after."""
+    t0 = time.perf_counter()
+    before = after = 0
+    for view in viewCache.values():
+        for edgeMap in view.values():
+            for ivs in edgeMap.values():
+                before += len(ivs)
+        normalizeView(view)
+        for edgeMap in view.values():
+            for ivs in edgeMap.values():
+                after += len(ivs)
+    if verbose:
+        print(f"  normalized viewsheds: {before} -> {after} intervals "
+              f"({time.perf_counter() - t0:.1f}s)")
+    return before, after
 
 def _newBeamState():
     return {"mergedIntervals": {}, "visibleLength": {},
@@ -1447,34 +1614,166 @@ def _viewshedTask(antenna):
     # dropped (the adaptive path re-solves them against a bigger scene).
     profile, _beyondRadius = sweepAllEdges((ax, ay), allEdges, allVertsEdges,
                                            owner, radius=radius)
-    view = {idxs[localPi]: {ei: list(ivs) for ei, ivs in edgeMap.items()}
-            for localPi, edgeMap in profile.items()}
+    view = normalizeView(
+        {idxs[localPi]: {ei: list(ivs) for ei, ivs in edgeMap.items()}
+         for localPi, edgeMap in profile.items()})
     return antenna, view
+
+# ---------------------------------------------------------------------------
+#  CRASH CHECKPOINTS  (shared by the viewshed precompute and the
+#  centrality visibility-graph build -- both are long parallel loops over
+#  independent items, and both must survive an interruption without
+#  redoing hours of work)
+# ---------------------------------------------------------------------------
+
+class _CheckpointWriter:
+    """
+    Append-only crash checkpoint for a long parallel loop.
+
+    Format: a metadata header frame, then one pickle frame per flush
+    holding the (key, value) pairs finished since the previous flush.
+    Appending whole frames (rather than rewriting a single blob) is what
+    keeps the cost proportional to NEW work instead of total work, and it
+    means a crash can damage at most the frame being written -- readers
+    stop cleanly at a torn tail (see _loadCheckpointPairs).
+
+    The flush interval is deliberately short relative to the run: each
+    item is written exactly once no matter how often we checkpoint, so a
+    shorter interval buys finer crash granularity for only extra
+    flush/fsync calls -- while a long one risks never firing at all and
+    holds more finished work in RAM waiting to be written.
+    """
+
+    def __init__(self, path, meta, every=120.0):
+        self.path = path
+        self.every = every
+        self.pending = []
+        self._last = time.monotonic()
+        os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+        isNew = not os.path.exists(path)
+        self.fh = open(path, "ab")
+        if isNew:
+            pickle.dump({"__checkpoint_meta__": meta or {}}, self.fh,
+                        protocol=pickle.HIGHEST_PROTOCOL)
+            self.fh.flush()
+
+    def add(self, key, value):
+        self.pending.append((key, value))
+
+    def _write(self):
+        if not self.pending:
+            return False
+        pickle.dump(self.pending, self.fh, protocol=pickle.HIGHEST_PROTOCOL)
+        self.fh.flush()
+        os.fsync(self.fh.fileno())
+        self.pending = []
+        return True
+
+    def maybeFlush(self):
+        """Write the pending batch if the interval has elapsed. Returns
+        True if anything was actually written."""
+        if time.monotonic() - self._last < self.every:
+            return False
+        wrote = self._write()
+        self._last = time.monotonic()
+        return wrote
+
+    def close(self):
+        """Flush whatever is left. Called from a finally: an interrupted
+        run keeping its progress is the entire point."""
+        try:
+            self._write()
+        finally:
+            self.fh.close()
+
+
+def _loadCheckpointPairs(path, meta, verbose=True):
+    """
+    Load the (key, value) pairs from a _CheckpointWriter file as a dict
+    (empty when there is nothing usable).
+
+    Reading stops cleanly at end-of-file OR at a frame that fails to
+    unpickle -- the latter is the signature of a crash midway through an
+    append, and everything written before it is still valid. A metadata
+    mismatch (different dataset, radius, or settings) discards the whole
+    file rather than resuming from work that no longer applies.
+    """
+    if not os.path.exists(path):
+        return {}
+    out = {}
+    try:
+        with open(path, "rb") as f:
+            header = pickle.load(f)
+            if not (isinstance(header, dict)
+                    and header.get("__checkpoint_meta__") == meta):
+                if verbose:
+                    print(f"  checkpoint {path} is from a different "
+                          f"dataset/config; ignoring it")
+                return {}
+            while True:
+                for key, value in pickle.load(f):
+                    out[key] = value
+    except EOFError:
+        pass                      # clean end of file
+    except Exception:
+        pass                      # torn final frame from a crash mid-append
+    return out
+
 
 def precomputeViewshedsParallel(polygons, candidates, radius=80.0, gridCell=80.0,
                                 processes=None, chunksize=50, verbose=True,
-                                maxRadius=None):
+                                maxRadius=None, checkpointPath=None,
+                                checkpointMeta=None, checkpointEvery=120.0,
+                                precomputed=None):
     """
     Compute every candidate's viewshed across CPU cores.
     Returns {candidate: {bldgIdx: {edgeIdx: [intervals]}}}, same as the serial cache.
+
+    Crash safety (all optional, off when checkpointPath is None):
+      precomputed     : {candidate: view} already computed in an earlier,
+                        interrupted run (from _loadCheckpointPairs) --
+                        these candidates are skipped, not re-swept.
+      checkpointPath  : append-only checkpoint file, written every
+                        checkpointEvery seconds -- see _CheckpointWriter
+                        for the format and why the interval is short. The
+                        caller deletes this file once the real cache is
+                        saved.
+      checkpointMeta  : dict written as the file's header frame (dataset
+                        fingerprint + radii) so a stale checkpoint from a
+                        different dataset/config is refused on load.
     """
     import multiprocessing as mp
     if processes is None:
         processes = os.cpu_count() or 1
+    viewCache = dict(precomputed) if precomputed else {}
+    todo = [c for c in candidates if c not in viewCache] if viewCache else list(candidates)
     if verbose:
-        print(f"Precomputing {len(candidates)} viewsheds across {processes} processes...")
+        skipNote = f" ({len(viewCache)} restored from checkpoint)" if viewCache else ""
+        print(f"Precomputing {len(todo)} viewsheds across {processes} processes...{skipNote}")
+    if not todo:
+        return viewCache
 
-    viewCache = {}
-    with mp.Pool(processes=processes,
-                 initializer=_initWorker,
-                 initargs=(polygons, radius, gridCell, maxRadius)) as pool:
-        done = 0
-        for antenna, view in pool.imap_unordered(_viewshedTask, candidates,
-                                                  chunksize=chunksize):
-            viewCache[antenna] = view
-            done += 1
-            if verbose and done % 5000 == 0:
-                print(f"  {done}/{len(candidates)}")
+    ck = (_CheckpointWriter(checkpointPath, checkpointMeta, checkpointEvery)
+          if checkpointPath is not None else None)
+    try:
+        with mp.Pool(processes=processes,
+                     initializer=_initWorker,
+                     initargs=(polygons, radius, gridCell, maxRadius)) as pool:
+            done = 0
+            for antenna, view in pool.imap_unordered(_viewshedTask, todo,
+                                                      chunksize=chunksize):
+                viewCache[antenna] = view
+                done += 1
+                if ck is not None:
+                    ck.add(antenna, view)
+                    if ck.maybeFlush() and verbose:
+                        print(f"  checkpoint: {len(viewCache)}/{len(candidates)} "
+                              f"viewsheds safe on disk")
+                if verbose and done % 5000 == 0:
+                    print(f"  {done}/{len(todo)}")
+    finally:
+        if ck is not None:
+            ck.close()
     return viewCache
 
 # ===========================================================================
@@ -1600,15 +1899,32 @@ def buildAndCacheViewsheds(polygons, radius=80.0, gridCell=80.0, path=None,
     candidates = candidateList(polygons)
     perim = {i: polygonPerimeter(p) for i, p in enumerate(polygons)}
 
+    # Mid-precompute crash protection: results are appended to a sibling
+    # .partial file every few minutes (see precomputeViewshedsParallel), and
+    # a restart after a crash resumes from it instead of re-sweeping from
+    # scratch. Deleted once the real cache is fully saved.
+    partialPath = (path + ".partial") if path is not None else None
+    checkpointMeta = {"fingerprint": _datasetFingerprint(polygons),
+                      "radius": radius, "maxRadius": maxRadius,
+                      "normalized": True}
+    precomputed = (_loadCheckpointPairs(partialPath, checkpointMeta,
+                                        verbose=verbose)
+                   if partialPath else {})
+
     if parallel:
         viewCache = precomputeViewshedsParallel(polygons, candidates,
                                                 radius=radius, gridCell=gridCell,
-                                                verbose=verbose, maxRadius=maxRadius)
+                                                verbose=verbose, maxRadius=maxRadius,
+                                                checkpointPath=partialPath,
+                                                checkpointMeta=checkpointMeta,
+                                                precomputed=precomputed)
     else:
         grid = SpatialGrid(polygons, cell=gridCell)
-        viewCache = {}
+        viewCache = dict(precomputed)
         adaptive = maxRadius is not None and maxRadius > radius
         for i, c in enumerate(candidates):
+            if c in viewCache:
+                continue
             viewCache[c] = (candidateViewshedAdaptive(c, polygons, grid, radius, maxRadius)
                             if adaptive else
                             candidateViewshed(c, polygons, grid, radius))
@@ -1620,6 +1936,11 @@ def buildAndCacheViewsheds(polygons, radius=80.0, gridCell=80.0, path=None,
                       maxRadius=maxRadius)
         if verbose:
             print(f"Saved cache to {path}")
+        if partialPath and os.path.exists(partialPath):
+            try:
+                os.unlink(partialPath)   # full cache saved; checkpoint obsolete
+            except OSError:
+                pass
 
     return candidates, viewCache, perim
 
@@ -1637,6 +1958,9 @@ def saveViewCache(path, polygons, radius, candidates, viewCache, perim,
         "maxRadius": maxRadius,       # adaptive corridor reach (None = plain)
         "nCandidates": len(candidates),
         "fingerprint": _datasetFingerprint(polygons),
+        # every interval list sorted + unioned (see normalizeView); a cache
+        # without this flag is upgraded in place on load
+        "normalized": True,
         "candidates": candidates,
         "viewCache": viewCache,
         "perim": perim,
@@ -1664,8 +1988,12 @@ def loadViewCache(path, polygons, radius, maxRadius=None):
     AND adaptive corridor reach (maxRadius) -- a cache built with different
     ADAPTIVE_DOUBLINGS settings holds genuinely different viewsheds, so it is
     refused rather than silently loaded (previously only the filename encoded
-    this). Returns (candidates, viewCache, perim). Raises ValueError on
-    mismatch.
+    this). Raises ValueError on mismatch.
+
+    Returns (candidates, viewCache, perim, normalized), where `normalized`
+    reports whether the intervals are already sorted+unioned. A False here
+    is NOT a mismatch (the geometry is still correct and reusable) -- the
+    caller upgrades the cache in place rather than rebuilding it.
     """
     # Unpickling a multi-GB cache creates hundreds of millions of small
     # tuples/lists/dicts, and the garbage collector tracks every one as it
@@ -1695,7 +2023,8 @@ def loadViewCache(path, polygons, radius, maxRadius=None):
     if blob["fingerprint"] != _datasetFingerprint(polygons):
         raise ValueError("Cache was built from a different dataset "
                          "(fingerprint mismatch). Rebuild the cache.")
-    return blob["candidates"], blob["viewCache"], blob["perim"]
+    return (blob["candidates"], blob["viewCache"], blob["perim"],
+            bool(blob.get("normalized")))
 
 
 def loadOrBuildViewsheds(polygons, radius=80.0, gridCell=80.0, path="viewcache.pkl",
@@ -1707,11 +2036,31 @@ def loadOrBuildViewsheds(polygons, radius=80.0, gridCell=80.0, path="viewcache.p
     import os
     if os.path.exists(path):
         try:
-            candidates, viewCache, perim = loadViewCache(path, polygons, radius,
-                                                         maxRadius=maxRadius)
+            candidates, viewCache, perim, normalized = loadViewCache(
+                path, polygons, radius, maxRadius=maxRadius)
             if verbose:
                 print(f"Loaded cache from {path} "
                       f"({len(candidates)} candidates, radius {radius})")
+            if not normalized:
+                # One-time upgrade of a cache built before interval
+                # normalization. The hot path assumes sorted, disjoint
+                # interval lists (see _addedLengthNorm), so this is not
+                # optional -- but it is a pure union-preserving rewrite,
+                # so the cache stays valid for the same dataset/radius.
+                # Re-saved (atomically) so future runs skip the pass.
+                if verbose:
+                    print("  cache predates interval normalization; "
+                          "upgrading it in place")
+                normalizeViewCache(viewCache, verbose=verbose)
+                try:
+                    saveViewCache(path, polygons, radius, candidates,
+                                  viewCache, perim, maxRadius=maxRadius)
+                    if verbose:
+                        print(f"  re-saved normalized cache to {path}")
+                except OSError as e:
+                    if verbose:
+                        print(f"  (could not re-save cache: {e}; "
+                              f"continuing with the in-memory upgrade)")
             return candidates, viewCache, perim
         except ValueError as e:
             if verbose:
@@ -1719,6 +2068,341 @@ def loadOrBuildViewsheds(polygons, radius=80.0, gridCell=80.0, path="viewcache.p
     return buildAndCacheViewsheds(polygons, radius, gridCell, path,
                                   parallel=parallel, verbose=verbose,
                                   maxRadius=maxRadius)
+
+# ===========================================================================
+#  PACKED VIEWSHED  (compact numpy mirror of the viewCache)
+#
+#  The pickled viewCache is nested dicts of tuples -- ~4x its 1 GB disk
+#  size once unpickled, which is why refine workers could never each hold
+#  a copy on a 16 GB machine. This packs the exact same intervals into
+#  flat numpy arrays (CSR-style: candidate -> building -> edge -> interval
+#  ranges) saved as .npy files. Worker processes np.load them with
+#  mmap_mode="r", so all workers plus the parent share ONE physical copy
+#  through the OS page cache -- that is what makes the parallel swap
+#  refinement fit in memory.
+#
+#  Two derived per-(candidate, building) tables come free and vectorized:
+#    cbExtra : unmerged interval-length sum  (== buildExtraLen's values)
+#    cbCov   : merged standalone coverage fraction (tau-independent), so
+#              _CoverageState.__init__ no longer re-merges every
+#              (candidate, building) pair per subcase -- it was doing that
+#              once per greedy call, nine times per solve.
+# ===========================================================================
+
+_PACKED_NAMES = ("candPtr", "cbBuilding", "cbEdgePtr", "cbeEdge",
+                 "cbeIvPtr", "ivLo", "ivHi", "cbExtra", "cbCov", "perim")
+
+
+def _segmentedUnionLengths(ivLo, ivHi, segPtr):
+    """Union (merged) length of the intervals in each segment.
+    segPtr : (S+1,) interval index boundaries; every segment non-empty.
+    Exact segmented cummax via log2(maxSegLen) doubling passes -- no
+    group-offset trick, so no precision loss from large offsets."""
+    S = len(segPtr) - 1
+    n = len(ivLo)
+    if n == 0:
+        return np.zeros(S, dtype=np.float64)
+    gid = np.repeat(np.arange(S, dtype=np.int64), np.diff(segPtr))
+    order = np.lexsort((ivLo, gid))
+    glo = ivLo[order]
+    ghi = ivHi[order]
+    g = gid[order]
+    maxSeg = int(np.diff(segPtr).max())
+    runmax = ghi.copy()                    # cummax of hi within each segment
+    shift = 1
+    while shift < maxSeg:
+        prev = np.full(n, -np.inf)
+        prev[shift:] = runmax[:-shift]
+        same = np.zeros(n, dtype=bool)
+        same[shift:] = g[shift:] == g[:-shift]
+        np.maximum(runmax, np.where(same, prev, -np.inf), out=runmax)
+        shift *= 2
+    prevHi = np.full(n, -np.inf)           # cummax over STRICTLY earlier elems
+    prevHi[1:] = runmax[:-1]
+    firstInSeg = np.ones(n, dtype=bool)
+    firstInSeg[1:] = g[1:] != g[:-1]
+    prevHi[firstInSeg] = -np.inf
+    contrib = np.clip(ghi - np.maximum(glo, prevHi), 0.0, None)
+    return np.add.reduceat(contrib, segPtr[:-1])
+
+
+def buildPackedViewshed(candidates, viewCache, perim, nBuildings, verbose=True):
+    """Flatten viewCache into the packed-array dict described above.
+    Buildings are sorted ascending within each candidate (binary-search
+    lookups); (candidate, building) pairs with no intervals are dropped
+    (they contribute nothing anywhere)."""
+    t0 = time.perf_counter()
+    C = len(candidates)
+    nCB = nCBE = nIV = 0
+    for c in candidates:
+        vc = viewCache[c]
+        nCB += len(vc)
+        for em in vc.values():
+            nCBE += len(em)
+            for ivs in em.values():
+                nIV += len(ivs)
+
+    candPtr = np.zeros(C + 1, dtype=np.int64)
+    cbBuilding = np.zeros(nCB, dtype=np.int32)
+    cbEdgePtr = np.zeros(nCB + 1, dtype=np.int64)
+    cbeEdge = np.zeros(nCBE, dtype=np.int32)
+    cbeIvPtr = np.zeros(nCBE + 1, dtype=np.int64)
+    ivLo = np.zeros(nIV, dtype=np.float64)
+    ivHi = np.zeros(nIV, dtype=np.float64)
+
+    iCB = iCBE = iIV = 0
+    for ci, c in enumerate(candidates):
+        vc = viewCache[c]
+        for b in sorted(vc):
+            edgeStart = iCBE
+            for ei, ivs in vc[b].items():
+                nI = len(ivs)
+                if nI == 0:
+                    continue
+                cbeEdge[iCBE] = ei
+                if nI == 1:
+                    ivLo[iIV] = ivs[0][0]
+                    ivHi[iIV] = ivs[0][1]
+                else:
+                    los, his = zip(*ivs)
+                    ivLo[iIV:iIV + nI] = los
+                    ivHi[iIV:iIV + nI] = his
+                iIV += nI
+                iCBE += 1
+                cbeIvPtr[iCBE] = iIV
+            if iCBE == edgeStart:
+                continue                       # empty pair -- drop it
+            cbBuilding[iCB] = b
+            iCB += 1
+            cbEdgePtr[iCB] = iCBE
+        candPtr[ci + 1] = iCB
+
+    cbBuilding = cbBuilding[:iCB]
+    cbEdgePtr = cbEdgePtr[:iCB + 1]
+    cbeEdge = cbeEdge[:iCBE]
+    cbeIvPtr = cbeIvPtr[:iCBE + 1]
+    ivLo = ivLo[:iIV]
+    ivHi = ivHi[:iIV]
+
+    perimArr = np.array([perim[i] for i in range(nBuildings)], dtype=np.float64)
+
+    # unmerged per-(c,b) sums: segment-local reduceat, no long cumsums
+    cbIvStart = cbeIvPtr[cbEdgePtr[:-1]] if iCB else np.zeros(0, dtype=np.int64)
+    cbExtra = (np.add.reduceat(ivHi - ivLo, cbIvStart)
+               if iCB else np.zeros(0, dtype=np.float64))
+
+    # merged per-(c,b) coverage: union per edge group, summed per pair
+    edgeUnion = _segmentedUnionLengths(ivLo, ivHi, cbeIvPtr)
+    cbUnion = (np.add.reduceat(edgeUnion, cbEdgePtr[:-1])
+               if iCB else np.zeros(0, dtype=np.float64))
+    pb = perimArr[cbBuilding]
+    with np.errstate(divide="ignore", invalid="ignore"):
+        cbCov = np.where(pb >= 1e-9,
+                         np.minimum(cbUnion / np.maximum(pb, 1e-30), 1.0),
+                         0.0)
+
+    if verbose:
+        print(f"  packed viewshed: {iCB} (cand,bldg) pairs, {iIV} intervals "
+              f"({time.perf_counter() - t0:.1f}s)")
+    return {"candPtr": candPtr, "cbBuilding": cbBuilding,
+            "cbEdgePtr": cbEdgePtr, "cbeEdge": cbeEdge,
+            "cbeIvPtr": cbeIvPtr, "ivLo": ivLo, "ivHi": ivHi,
+            "cbExtra": cbExtra, "cbCov": cbCov, "perim": perimArr}
+
+
+def savePackedViewshed(prefix, packed, meta):
+    """One .npy per array (so they can be memory-mapped individually) plus
+    a .meta.json used to validate on load. Arrays are written to temp
+    names and renamed into place; the meta file is written LAST, so a
+    crash mid-save just looks like 'no valid packed cache' next run."""
+    dirName = os.path.dirname(os.path.abspath(prefix))
+    os.makedirs(dirName, exist_ok=True)
+    metaPath = prefix + ".meta.json"
+    if os.path.exists(metaPath):
+        os.unlink(metaPath)                   # invalidate before touching arrays
+    for name in _PACKED_NAMES:
+        tmp = f"{prefix}.{name}.tmp.npy"   # ends in .npy so np.save keeps it
+        np.save(tmp, packed[name])
+        os.replace(tmp, f"{prefix}.{name}.npy")
+    with open(metaPath + ".tmp", "w") as f:
+        json.dump(meta, f)
+    os.replace(metaPath + ".tmp", metaPath)
+
+
+def loadPackedViewshed(prefix, mmapMode="r"):
+    """Load the packed arrays, memory-mapped by default (near-zero RAM and
+    load time; pages are shared between every process that maps them)."""
+    return {name: np.load(f"{prefix}.{name}.npy", mmap_mode=mmapMode)
+            for name in _PACKED_NAMES}
+
+
+def loadOrBuildPackedViewshed(prefix, candidates, viewCache, perim, polygons,
+                              verbose=True):
+    """Load the packed mirror if present and matching this dataset/cache;
+    otherwise build it from viewCache, save it, and reload memory-mapped
+    (dropping the in-heap build copies)."""
+    # "normalized" pins the packed arrays to normalized intervals: cbExtra
+    # is the UNION length there (a tighter, still-sound upper bound) rather
+    # than the raw fragment sum, so a packed file built before normalization
+    # must be rebuilt rather than reused.
+    meta = {"nCandidates": len(candidates),
+            "nBuildings": len(polygons),
+            "normalized": True,
+            "fingerprint": _datasetFingerprint(polygons)}
+    metaPath = prefix + ".meta.json"
+    if os.path.exists(metaPath):
+        try:
+            with open(metaPath) as f:
+                onDisk = json.load(f)
+            if onDisk == meta:
+                packed = loadPackedViewshed(prefix, mmapMode="r")
+                if verbose:
+                    print(f"  packed viewshed loaded (mmap) from {prefix}.*.npy")
+                return packed
+            if verbose:
+                print("  packed viewshed on disk is stale; rebuilding")
+        except Exception as e:
+            if verbose:
+                print(f"  packed viewshed unusable ({e}); rebuilding")
+    packed = buildPackedViewshed(candidates, viewCache, perim, len(polygons),
+                                 verbose=verbose)
+    savePackedViewshed(prefix, packed, meta)
+    del packed
+    return loadPackedViewshed(prefix, mmapMode="r")
+
+
+def extraLenFromPacked(candidates, packed):
+    """{c: {b: unmergedLengthSum}} -- same contents buildExtraLen computes,
+    but read straight out of the packed arrays (fast)."""
+    cp = np.asarray(packed["candPtr"]).tolist()
+    cb = np.asarray(packed["cbBuilding"]).tolist()
+    ce = np.asarray(packed["cbExtra"]).tolist()
+    return {c: dict(zip(cb[cp[i]:cp[i + 1]], ce[cp[i]:cp[i + 1]]))
+            for i, c in enumerate(candidates)}
+
+
+def baseCovFromPacked(candidates, packed):
+    """{c: {b: mergedStandaloneCoverage}} -- the tau-independent per-pair
+    coverage _CoverageState.__init__ needs, computed once per cache
+    instead of re-merged inside every greedy call."""
+    cp = np.asarray(packed["candPtr"]).tolist()
+    cb = np.asarray(packed["cbBuilding"]).tolist()
+    cc = np.asarray(packed["cbCov"]).tolist()
+    return {c: dict(zip(cb[cp[i]:cp[i + 1]], cc[cp[i]:cp[i + 1]]))
+            for i, c in enumerate(candidates)}
+
+
+def buildBuildingToCandidates(candidates, viewCache):
+    """building -> set(candidates that see it). Built once per solve and
+    shared read-only by every greedy/lookahead/refine call (each used to
+    rebuild its own copy -- ~4M set inserts per subcase)."""
+    d = defaultdict(set)
+    for c in candidates:
+        for b in viewCache[c]:
+            d[b].add(c)
+    return d
+
+
+def buildRefineParallelContext(candidates, packedPrefix, processes=None):
+    """Everything refineWithSwapsV2 needs to run its pass scan across CPU
+    cores. Built once per solve, reused by every refine call.
+
+      candidates   : the cache's candidate list (defines packed indices)
+      packedPrefix : prefix the packed .npy files were saved under
+      processes    : worker count (None -> os.cpu_count(), 0 disables)
+
+    Contents: the mmap'd packed arrays, candidate->index map, and a
+    building->candidate-index CSR (for fast per-pass loss-hit counting).
+    """
+    if processes is None:
+        processes = os.cpu_count() or 1
+    packed = loadPackedViewshed(packedPrefix, mmapMode="r")
+    candIndex = {c: i for i, c in enumerate(candidates)}
+    cb = np.asarray(packed["cbBuilding"])
+    candPtr = np.asarray(packed["candPtr"])
+    candOfCb = np.repeat(np.arange(len(candidates), dtype=np.int64),
+                         np.diff(candPtr))
+    order = np.argsort(cb, kind="stable")
+    bSorted = cb[order]
+    bToCandFlat = candOfCb[order]
+    nB = len(packed["perim"])
+    bToCandPtr = np.searchsorted(bSorted, np.arange(nB + 1))
+    return {"packed": packed, "prefix": packedPrefix, "processes": processes,
+            "candidates": list(candidates), "candIndex": candIndex,
+            "bToCandFlat": bToCandFlat, "bToCandPtr": bToCandPtr}
+
+
+# --- worker side of the parallel refine pass scan ---
+_RPW = {}
+
+def _initRefinePackedWorker(prefix):
+    _RPW["p"] = loadPackedViewshed(prefix, mmapMode="r")
+
+def _packedFind(p, aIdx, b):
+    """Index into the cb arrays for (candidate aIdx, building b), or -1."""
+    lo = int(p["candPtr"][aIdx]); hi = int(p["candPtr"][aIdx + 1])
+    cb = p["cbBuilding"]
+    j = lo + int(np.searchsorted(cb[lo:hi], b))
+    if j < hi and int(cb[j]) == b:
+        return j
+    return -1
+
+def _packedCovAtLeast(p, aIdx, b, baseM, baseVis, pb, tau):
+    """Does adding candidate aIdx's intervals for building b on top of the
+    already-merged baseline (baseM per edge, baseVis total) reach tau?
+    Mirrors _covWithExtra exactly: same upper-bound short-circuit, same
+    _mergeIntervalsIncremental arithmetic on the same interval values."""
+    if pb < 1e-9:
+        return False
+    j = _packedFind(p, aIdx, b)
+    if j < 0:
+        return baseVis / pb >= tau
+    if (baseVis + float(p["cbExtra"][j])) / pb < tau:
+        return False
+    added = 0.0
+    e0 = int(p["cbEdgePtr"][j]); e1 = int(p["cbEdgePtr"][j + 1])
+    cbeEdge = p["cbeEdge"]; ivPtr = p["cbeIvPtr"]
+    ivLo = p["ivLo"]; ivHi = p["ivHi"]
+    for g in range(e0, e1):
+        i0 = int(ivPtr[g]); i1 = int(ivPtr[g + 1])
+        ivs = list(zip(ivLo[i0:i1].tolist(), ivHi[i0:i1].tolist()))
+        added += _addedLengthNorm(baseM.get(int(cbeEdge[g]), []), ivs)
+    return min((baseVis + added) / pb, 1.0) >= tau
+
+def _refineScanTask(task):
+    """Evaluate one removal candidate's surviving (r, a) pairs exactly.
+    task = (tau, taskId, nLoss, floorDelta, baselines, pairs) where
+      baselines : {b: (mergedByEdge, vis)}  -- the without-r baseline for
+                  every building any pair below needs
+      pairs     : [(aIdx, gainA, tipCheckBs, lossHitBs), ...]
+    Returns (taskId, bestDelta, bestAIdx) with bestDelta > floorDelta, or
+    (taskId, floorDelta, -1) if nothing beat the floor."""
+    tau, taskId, nLoss, floorDelta, baselines, pairs = task
+    p = _RPW["p"]
+    perim = p["perim"]
+    bestDelta = floorDelta
+    bestA = -1
+    for aIdx, gainA, tipBs, lossBs in pairs:
+        if gainA + len(lossBs) - nLoss <= bestDelta:
+            continue
+        newly = gainA
+        for b in tipBs:
+            m, v = baselines[b]
+            if not _packedCovAtLeast(p, aIdx, b, m, v, float(perim[b]), tau):
+                newly -= 1
+        delta = newly - nLoss
+        for b in lossBs:
+            pb = float(perim[b])
+            if pb < 1e-9:
+                continue
+            m, v = baselines[b]
+            if _packedCovAtLeast(p, aIdx, b, m, v, pb, tau):
+                delta += 1
+        if delta > bestDelta:
+            bestDelta = delta
+            bestA = aIdx
+    return taskId, bestDelta, bestA
+
 
 # ===========================================================================
 #  SWAP REFINEMENT V2  (verified swaps + incremental pass engine)
@@ -1777,18 +2461,32 @@ def _covWithExtra(baseMerged, baseVis, extra, perimB, tauHint=None):
             return ub / perimB
     added = 0.0
     for ei, newIvs in extra.items():
-        _, a = _mergeIntervalsIncremental(baseMerged.get(ei, []), newIvs)
-        added += a
+        added += _addedLengthNorm(baseMerged.get(ei, []), newIvs)
     return min((baseVis + added) / perimB, 1.0)
 
 
 def refineWithSwapsV2(polygons, placed, tau, candidates, viewCache,
                       maxIterations=10, verbose=True,
                       logPrefix="    ", selfCheck=False, timeBudget=None,
-                      extraLen=None):
+                      extraLen=None, buildingToCands=None, parallelCtx=None):
     """
     Local-search swap refinement over the COMPLETE (remove r, add a) space,
     with verified commits and an INCREMENTAL pass engine.
+
+    parallelCtx : optional buildRefineParallelContext(...) result. When
+    given (and its process count > 0), each pass's expensive (r, a) scan
+    runs ACROSS CPU CORES: a vectorized numpy upper bound first prunes the
+    pair space in the parent (same bound as the serial scan), then the
+    surviving pairs are evaluated exactly by worker processes that read
+    candidate intervals from the memory-mapped packed viewshed (one
+    physical copy shared by all workers -- workers never hold the
+    multi-GB viewCache). Verification and commits stay in the parent,
+    unchanged, so every committed swap is still exact-checked the same
+    way. Results can differ from the serial scan only in which of several
+    equally-good swaps gets picked first.
+
+    buildingToCands : optional shared buildBuildingToCandidates() result
+    (read-only), so repeated calls skip rebuilding it.
 
     Completeness (unchanged from the previous version): every (r, a) pair
     is considered every pass -- INTERACTING pairs (a's viewshed shares a
@@ -1820,7 +2518,45 @@ def refineWithSwapsV2(polygons, placed, tau, candidates, viewCache,
 
     committedView = {c: viewCache[c] for c in placed}
 
-    viewSet = {c: frozenset(viewCache[c].keys()) for c in candidates}
+    useParallel = bool(parallelCtx) and parallelCtx.get("processes", 0) > 0
+    pool = None
+    if useParallel:
+        _pk = parallelCtx["packed"]
+        _candIndex = parallelCtx["candIndex"]
+        _candList = parallelCtx["candidates"]
+        _pkCandPtr = np.asarray(_pk["candPtr"])
+        _pkCbB = np.asarray(_pk["cbBuilding"])
+        _bToCandFlat = parallelCtx["bToCandFlat"]
+        _bToCandPtr = parallelCtx["bToCandPtr"]
+        nProcs = parallelCtx["processes"]
+        viewSet = None                      # packed arrays replace it
+
+        def _candSlice(i):
+            return int(_pkCandPtr[i]), int(_pkCandPtr[i + 1])
+
+        def _seesB(i, b):
+            lo, hi = _candSlice(i)
+            j = lo + int(np.searchsorted(_pkCbB[lo:hi], b))
+            return j < hi and int(_pkCbB[j]) == b
+
+        def _seesAnyOf(a, bset):
+            if not bset:
+                return False
+            lo, hi = _candSlice(_candIndex[a])
+            if hi == lo:
+                return False
+            sub = _pkCbB[lo:hi]
+            arr = np.fromiter(bset, dtype=np.int64, count=len(bset))
+            pos = np.searchsorted(sub, arr)
+            valid = pos < (hi - lo)
+            return bool(np.any(sub[pos[valid]] == arr[valid]))
+
+        import multiprocessing as mp
+        pool = mp.Pool(processes=nProcs,
+                       initializer=_initRefinePackedWorker,
+                       initargs=(parallelCtx["prefix"],))
+    else:
+        viewSet = {c: frozenset(viewCache[c].keys()) for c in candidates}
 
     # static upper-bound helper: total (unmerged) interval length candidate c
     # contributes to building b -- baseVis + extraLen is a sound upper bound
@@ -1848,10 +2584,13 @@ def refineWithSwapsV2(polygons, placed, tau, candidates, viewCache,
     servedNow = {b for b, v in globalVis.items()
                  if perim[b] > 1e-9 and v / perim[b] >= tau}
 
-    buildingToCandidates = defaultdict(set)
-    for c in candidates:
-        for b in viewSet[c]:
-            buildingToCandidates[b].add(c)
+    if buildingToCands is not None:
+        buildingToCandidates = buildingToCands   # shared, read-only here
+    else:
+        buildingToCandidates = defaultdict(set)
+        for c in candidates:
+            for b in viewCache[c]:
+                buildingToCandidates[b].add(c)
 
     committedViewSets = {c: frozenset(committedView[c].keys()) for c in placed}
 
@@ -1880,13 +2619,24 @@ def refineWithSwapsV2(polygons, placed, tau, candidates, viewCache,
     for r in placedSet:
         refreshBaseline(r, committedViewSets[r])
 
-    poolCache = {}                         # r -> tuple of candidates sharing >=1 building
+    poolCache = {}   # r -> candidates sharing >=1 building with r
+                     # (tuple of vertices serially; sorted ndarray of
+                     #  candidate INDICES in parallel mode)
 
     def buildPool(r):
-        pool = set()
+        if useParallel:
+            bs = committedViewSets[r]
+            if bs:
+                parts = [_bToCandFlat[_bToCandPtr[b]:_bToCandPtr[b + 1]]
+                         for b in bs]
+                poolCache[r] = np.unique(np.concatenate(parts))
+            else:
+                poolCache[r] = np.zeros(0, dtype=np.int64)
+            return
+        poolMembers = set()
         for b in committedViewSets[r]:
-            pool |= buildingToCandidates.get(b, set())
-        poolCache[r] = tuple(pool)
+            poolMembers |= buildingToCandidates.get(b, set())
+        poolCache[r] = tuple(poolMembers)
 
     for r in placedSet:
         buildPool(r)
@@ -1907,12 +2657,59 @@ def refineWithSwapsV2(polygons, placed, tau, candidates, viewCache,
                              viewCache[a].get(b), pb) >= tau
 
     def computeGain(a):
-        t = {b for b in viewSet[a] & unservedSet if _tips(a, b)}
+        if viewSet is not None:
+            touched = viewSet[a] & unservedSet
+        else:
+            lo, hi = _candSlice(_candIndex[a])
+            touched = [b for b in _pkCbB[lo:hi].tolist() if b in unservedSet]
+        t = {b for b in touched if _tips(a, b)}
         aTips[a] = t
         gains[a] = len(t)
 
-    for a in remaining:
-        computeGain(a)
+    if useParallel:
+        # Vectorized gain init: ONE numpy upper-bound filter over every
+        # (candidate, building) pair in the packed arrays, exact _tips
+        # checks only on the survivors -- replaces the python loop over
+        # all candidates (same bound _tips applies, so survivors match).
+        nB = len(_pk["perim"])
+        visArr = np.zeros(nB)
+        for b, v in globalVis.items():
+            visArr[b] = v
+        perimArr = np.asarray(_pk["perim"])
+        unservedArr = np.zeros(nB, dtype=bool)
+        if unservedSet:
+            unservedArr[np.fromiter(unservedSet, dtype=np.int64,
+                                    count=len(unservedSet))] = True
+        pbAll = perimArr[_pkCbB]
+        mask = unservedArr[_pkCbB] & (pbAll >= 1e-9)
+        mask &= (visArr[_pkCbB] + np.asarray(_pk["cbExtra"])) >= tau * pbAll
+        survivors = np.flatnonzero(mask)
+        for a in remaining:
+            aTips[a] = set()
+            gains[a] = 0
+        if len(survivors):
+            candOf = (np.searchsorted(_pkCandPtr, survivors, side="right") - 1)
+            bList = np.asarray(_pkCbB)[survivors].tolist()
+            cList = candOf.tolist()
+            prevC = -1
+            curA = None
+            inRem = False
+            for pos in range(len(cList)):
+                ci = cList[pos]
+                if ci != prevC:
+                    prevC = ci
+                    curA = _candList[ci]
+                    inRem = curA in remaining
+                if not inRem:
+                    continue
+                b = bList[pos]
+                if _tips(curA, b):
+                    aTips[curA].add(b)
+            for a, t in aTips.items():
+                gains[a] = len(t)
+    else:
+        for a in remaining:
+            computeGain(a)
 
     rejected = set()
     nSwaps = 0
@@ -1953,10 +2750,99 @@ def refineWithSwapsV2(polygons, placed, tau, candidates, viewCache,
         bestCross = False
         pairsEvaluated = pairsPruned = 0
 
+        if useParallel:
+            # ==== PARALLEL PASS SCAN ====
+            # Same three ingredients as the serial scan below -- the exact
+            # non-interacting formula, the gains+lossHit upper bound, and
+            # exact evaluation of whatever survives -- but the bound runs
+            # vectorized in numpy and the exact evaluations run across
+            # worker processes reading the mmap'd packed viewshed.
+            # ---- phase 0: best NON-interacting swap (cheap, exact) ----
+            rOrder = sorted(placedSet, key=lambda x: len(lossSet[x]))
+            for r in rOrder:
+                nLoss = len(lossSet[r])
+                for a in gainOrder:
+                    d = gains[a] - nLoss
+                    if d <= bestDelta:
+                        break
+                    if (r, a) in rejected or _seesAnyOf(a, committedViewSets[r]):
+                        continue
+                    bestDelta = d
+                    bestSwap = (r, a)
+                    bestCross = True
+                    break
+            floorDelta = bestDelta
+            # ---- phase 1: vectorized upper bound over each r's pool ----
+            gainsArr = np.fromiter((gains.get(c, 0) for c in _candList),
+                                   dtype=np.int64, count=len(_candList))
+            tasks, taskRs = [], []
+            for r in rOrder:
+                loss = lossSet[r]
+                nLoss = len(loss)
+                poolIdx = poolCache[r]
+                if len(poolIdx) == 0:
+                    continue
+                if loss:
+                    hitIdx = np.concatenate(
+                        [_bToCandFlat[_bToCandPtr[b]:_bToCandPtr[b + 1]]
+                         for b in loss])
+                    pos = np.searchsorted(poolIdx, hitIdx)
+                    valid = pos < len(poolIdx)
+                    match = np.zeros(len(hitIdx), dtype=bool)
+                    match[valid] = poolIdx[pos[valid]] == hitIdx[valid]
+                    counts = np.bincount(pos[match], minlength=len(poolIdx))
+                    ub = gainsArr[poolIdx] + counts - nLoss
+                else:
+                    ub = gainsArr[poolIdx] - nLoss
+                surv = poolIdx[ub > floorDelta]
+                pairsPruned += len(poolIdx) - len(surv)
+                if len(surv) == 0:
+                    continue
+                rView = committedViewSets[r]
+                bw = baseWithout[r]
+                pairs = []
+                neededBs = set()
+                for i in surv.tolist():
+                    a = _candList[i]
+                    if a not in remaining or (r, a) in rejected:
+                        continue
+                    tipBs = list(aTips[a] & rView)
+                    lossBs = [b for b in loss if _seesB(i, b)]
+                    if gains[a] + len(lossBs) - nLoss <= floorDelta:
+                        continue
+                    pairs.append((i, gains[a], tipBs, lossBs))
+                    neededBs.update(tipBs)
+                    neededBs.update(lossBs)
+                if not pairs:
+                    continue
+                tasks.append((tau, len(tasks), nLoss, floorDelta,
+                              {b: bw[b] for b in neededBs}, pairs))
+                taskRs.append(r)
+                pairsEvaluated += len(pairs)
+            # ---- phase 2: exact evaluation across worker processes ----
+            if tasks:
+                if pairsEvaluated >= 64:
+                    outcomes = list(pool.imap_unordered(
+                        _refineScanTask, tasks,
+                        chunksize=max(1, len(tasks) // (nProcs * 4))))
+                else:
+                    _RPW["p"] = _pk    # tiny batch: same code, in-process
+                    outcomes = [_refineScanTask(t) for t in tasks]
+                # deterministic pick: highest delta, then lowest-loss r
+                # (task order), then lowest candidate index
+                outcomes.sort(key=lambda t: (-t[1], t[0], t[2]))
+                tId, d, aIdx = outcomes[0]
+                if aIdx >= 0 and d > bestDelta:
+                    bestDelta = d
+                    bestSwap = (taskRs[tId], _candList[aIdx])
+                    bestCross = False
+
         # ascending removal-loss order: cheap removals produce the biggest
         # deltas, raising bestDelta early so the ub check prunes harder on
-        # every antenna scanned after
-        for r in sorted(placedSet, key=lambda x: len(lossSet[x])):
+        # every antenna scanned after  (serial scan; skipped when the
+        # parallel scan above already did this pass)
+        for r in ([] if useParallel else
+                  sorted(placedSet, key=lambda x: len(lossSet[x]))):
             loss = lossSet[r]
             nLoss = len(loss)
             bw = baseWithout[r]
@@ -2146,6 +3032,10 @@ def refineWithSwapsV2(polygons, placed, tau, candidates, viewCache,
                   f"{bonus} -> {len(servedNow)} "
                   f"[{time.perf_counter()-itT0:.2f}s]")
 
+    if pool is not None:
+        pool.close()
+        pool.join()
+
     if verbose:
         if hitCap:
             stopReason = (f"swap cap hit ({maxIterations}) while still "
@@ -2223,7 +3113,9 @@ def candidateViewshedAdaptive(pt, polygons, grid, radius, maxRadius,
         else:
             openW = [(0.0, 2 * math.pi)] if not final else []
         if final or not openW:
-            return out
+            # corridor passes deliberately overlap at window boundaries;
+            # collapse every edge's fragments into a sorted disjoint union
+            return normalizeView(out)
         windows = openW
         r = min(r * factor, maxRadius)
 

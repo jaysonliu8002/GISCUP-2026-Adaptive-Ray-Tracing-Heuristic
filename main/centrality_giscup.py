@@ -43,9 +43,12 @@ and guard the call site with `if __name__ == "__main__":`.
 """
 
 import os
+import pickle
 
 from collections import defaultdict
-from lib_giscup import EPS, pointInsidePolygon, buildScene
+from lib_giscup import (EPS, pointInsidePolygon, buildScene,
+                        _CheckpointWriter, _loadCheckpointPairs,
+                        _datasetFingerprint)
 
 
 # ---------------------------------------------------------------------------
@@ -239,7 +242,9 @@ def _radiusBVHEdgesTask(i):
 
 def buildVisibilityGraphRadiusBVH(polygons, candidates, radius, gridCell=None,
                                   node_capacity=10, processes=None, chunksize=20,
-                                  progressEvery=None, verbose=True):
+                                  progressEvery=None, verbose=True,
+                                  checkpointPath=None, checkpointMeta=None,
+                                  checkpointEvery=120.0):
     """
     Radius-restricted, UNCAPPED visibility graph using the same BVH+slab+
     early-exit+multiprocessing machinery as buildVisibilityGraphUnrestrictedBVH,
@@ -263,6 +268,15 @@ def buildVisibilityGraphRadiusBVH(polygons, candidates, radius, gridCell=None,
                     list, so there's no systematic early-vertex-is-
                     expensive skew to rebalance against.
     progressEvery : print a progress line every N completed vertices.
+    checkpointPath / checkpointMeta / checkpointEvery
+                  : crash protection for this build, which is the single
+                    longest stage in the whole pipeline (~22 min at
+                    radius 640 on the full dataset). Finished vertices are
+                    appended to the checkpoint file every checkpointEvery
+                    seconds; a restart passes the same path and only tests
+                    the vertices still missing. See lib_giscup's
+                    _CheckpointWriter for the format. Off when
+                    checkpointPath is None.
 
     Note on progress metrics: unlike the unrestricted version, vertices/s
     is NOT systematically biased here (no positional skew -- see chunksize
@@ -294,37 +308,95 @@ def buildVisibilityGraphRadiusBVH(polygons, candidates, radius, gridCell=None,
              f"(over all {len(polygons)} buildings) -- one-time startup, timed separately...")
 
     adjacency = defaultdict(set)
+
+    # Resume: restore whatever a previous interrupted run got through, and
+    # test only the vertices still missing. Edges are re-applied
+    # symmetrically here exactly as they are below, so a resumed graph is
+    # indistinguishable from one built in a single run.
+    restored = (_loadCheckpointPairs(checkpointPath, checkpointMeta, verbose=verbose)
+                if checkpointPath else {})
+    todo = list(range(V))
+    if restored:
+        for u, visibleTo in restored.items():
+            for v in visibleTo:
+                adjacency[u].add(v)
+                adjacency[v].add(u)
+        todo = [i for i in range(V) if candidates[i] not in restored]
+        if verbose:
+            print(f"  resumed {len(restored)} vertices from {checkpointPath}; "
+                  f"{len(todo)} still to test")
+    if not todo:
+        if verbose:
+            nEdges = sum(len(n) for n in adjacency.values()) // 2
+            print(f"Done (fully restored from checkpoint): {V} vertices, "
+                  f"{nEdges} edges")
+        return adjacency
+
+    # Fail fast, in THIS process, with something actionable -- but only now
+    # that we know real work remains. shapely is otherwise imported solely
+    # inside the workers, so a missing install surfaces as every worker
+    # dying in its initializer: the pool keeps retrying and the real
+    # one-line cause ends up buried under tens of thousands of lines of
+    # repeated tracebacks. Checking here (rather than at function entry)
+    # also means a fully-restored resume, or a cached graph, still works
+    # without shapely installed at all.
+    try:
+        import shapely  # noqa: F401
+    except ImportError as e:
+        raise ImportError(
+            "buildVisibilityGraphRadiusBVH needs shapely, which is not "
+            "installed (pip install shapely). It is required ONLY for "
+            "vantage seeding -- set VANTAGE_SEED_PERCENT = 0 in "
+            "run_giscup.py to skip the visibility graph entirely and use "
+            "plain greedy."
+        ) from e
+
+    ck = (_CheckpointWriter(checkpointPath, checkpointMeta, checkpointEvery)
+          if checkpointPath else None)
     poolStartTime = time.perf_counter()
     processingStartTime = None
     completed = 0
     pairsCompleted = 0
 
-    with mp.Pool(processes=processes, initializer=_initRadiusBVHWorker,
-                initargs=(polygons, candidates, radius, gridCell, node_capacity)) as pool:
-        for u, visibleTo, nPairsInTask in pool.imap_unordered(_radiusBVHEdgesTask, range(V),
-                                                              chunksize=chunksize):
-            if processingStartTime is None:
-                processingStartTime = time.perf_counter()
-                if verbose:
-                    startupTime = processingStartTime - poolStartTime
-                    print(f"  worker pool ready, first result in ({startupTime:.1f}s startup) -- "
-                         f"rates below are computed from here, excluding that startup time")
-            for v in visibleTo:
-                adjacency[u].add(v)
-                adjacency[v].add(u)
-            completed += 1
-            pairsCompleted += nPairsInTask
-            if verbose and (completed % progressEvery == 0 or completed == V):
-                elapsed = time.perf_counter() - processingStartTime
-                vertexRate = completed / elapsed if elapsed > 0 else 0.0
-                pairRate = pairsCompleted / elapsed if elapsed > 0 else 0.0
-                remaining = (V - completed) / vertexRate if vertexRate > 0 else float('inf')
-                nEdgesSoFar = sum(len(nbrs) for nbrs in adjacency.values()) // 2
-                print(f"  ... {completed}/{V} vertices ({completed/V*100:.1f}%), "
-                     f"{pairsCompleted} pairs tested so far, "
-                     f"{elapsed:.1f}s processing, ~{remaining:.1f}s remaining, "
-                     f"{vertexRate:.2f} vertices/s ({pairRate:.0f} pairs/s), "
-                     f"{nEdgesSoFar} edges found so far")
+    nTodo = len(todo)
+    try:
+        with mp.Pool(processes=processes, initializer=_initRadiusBVHWorker,
+                     initargs=(polygons, candidates, radius, gridCell,
+                               node_capacity)) as pool:
+            for u, visibleTo, nPairsInTask in pool.imap_unordered(
+                    _radiusBVHEdgesTask, todo, chunksize=chunksize):
+                if processingStartTime is None:
+                    processingStartTime = time.perf_counter()
+                    if verbose:
+                        startupTime = processingStartTime - poolStartTime
+                        print(f"  worker pool ready, first result in ({startupTime:.1f}s startup) -- "
+                             f"rates below are computed from here, excluding that startup time")
+                for v in visibleTo:
+                    adjacency[u].add(v)
+                    adjacency[v].add(u)
+                completed += 1
+                pairsCompleted += nPairsInTask
+                if ck is not None:
+                    ck.add(u, visibleTo)
+                    if ck.maybeFlush() and verbose:
+                        print(f"  checkpoint: {len(restored) + completed}/{V} "
+                              f"vertices safe on disk")
+                if verbose and (completed % progressEvery == 0 or completed == nTodo):
+                    elapsed = time.perf_counter() - processingStartTime
+                    vertexRate = completed / elapsed if elapsed > 0 else 0.0
+                    pairRate = pairsCompleted / elapsed if elapsed > 0 else 0.0
+                    remaining = (nTodo - completed) / vertexRate if vertexRate > 0 else float('inf')
+                    nEdgesSoFar = sum(len(nbrs) for nbrs in adjacency.values()) // 2
+                    print(f"  ... {completed}/{nTodo} vertices ({completed/nTodo*100:.1f}%), "
+                         f"{pairsCompleted} pairs tested so far, "
+                         f"{elapsed:.1f}s processing, ~{remaining:.1f}s remaining, "
+                         f"{vertexRate:.2f} vertices/s ({pairRate:.0f} pairs/s), "
+                         f"{nEdgesSoFar} edges found so far")
+    finally:
+        # flush even on an exception -- an interrupted build keeping its
+        # progress is the whole point of the checkpoint
+        if ck is not None:
+            ck.close()
 
     if verbose:
         endTime = time.perf_counter()
@@ -337,6 +409,152 @@ def buildVisibilityGraphRadiusBVH(polygons, candidates, radius, gridCell=None,
              f"{processingElapsed:.1f}s processing), "
              f"{V/processingElapsed if processingElapsed>0 else 0:.2f} vertices/s during processing")
     return adjacency
+
+# ---------------------------------------------------------------------------
+#  VANTAGE CACHES  (disk persistence for the graph and the picked seeds)
+#
+#  The visibility-graph build is the longest single stage in the pipeline
+#  (~22 min at radius 640 on the full dataset), and its result depends only
+#  on (dataset, radius, node_capacity) -- not on tau, k, or the seed count.
+#  So it is cached on disk exactly like the viewshed cache, with the same
+#  guarantees: metadata is verified on load, a mismatch is refused rather
+#  than silently reused, and writes go through a temp file + os.replace so
+#  a crash mid-write cannot leave a truncated cache behind.
+#
+#  Two tiers, because they have different keys:
+#    seeds file : the final picked vertices. Keyed additionally by the seed
+#                 COUNT, so it only hits when the whole request matches --
+#                 but then it costs nothing to load, skipping even the
+#                 graph.
+#    graph file : the adjacency itself. Reused when the seed count changes
+#                 (a different VANTAGE_SEED_PERCENT or kMax), which is the
+#                 case the seeds file cannot serve.
+# ---------------------------------------------------------------------------
+
+def _atomicPickle(path, blob):
+    """Write a pickle via temp-file + os.replace (atomic on Windows and
+    POSIX), so an interrupted write never replaces a good file with a
+    truncated one."""
+    import tempfile
+    dirName = os.path.dirname(os.path.abspath(path))
+    os.makedirs(dirName, exist_ok=True)
+    fd, tmpPath = tempfile.mkstemp(dir=dirName, suffix=".tmp")
+    try:
+        with os.fdopen(fd, "wb") as f:
+            pickle.dump(blob, f, protocol=pickle.HIGHEST_PROTOCOL)
+        os.replace(tmpPath, path)
+    except BaseException:
+        try:
+            os.unlink(tmpPath)
+        except OSError:
+            pass
+        raise
+
+
+def _loadIfMeta(path, meta, what, verbose=True):
+    """Load a pickled {'meta':..., 'data':...} blob, returning data only if
+    the metadata matches exactly. Any mismatch or read failure returns
+    None (rebuild) rather than raising -- a stale cache is a normal
+    condition, not an error."""
+    if not path or not os.path.exists(path):
+        return None
+    try:
+        with open(path, "rb") as f:
+            blob = pickle.load(f)
+        if blob.get("meta") != meta:
+            if verbose:
+                print(f"  cached {what} at {path} is stale "
+                      f"(different dataset/settings); rebuilding")
+            return None
+        return blob["data"]
+    except Exception as e:
+        if verbose:
+            print(f"  cached {what} at {path} unusable ({e}); rebuilding")
+        return None
+
+
+def vantageMeta(polygons, candidates, radius, nodeCapacity):
+    """Identity of a visibility graph: everything its contents depend on."""
+    return {"fingerprint": _datasetFingerprint(polygons),
+            "nCandidates": len(candidates),
+            "radius": float(radius),
+            "nodeCapacity": int(nodeCapacity)}
+
+
+def loadOrBuildVantageGraph(polygons, candidates, radius, gridCell=None,
+                            nodeCapacity=10, processes=None, verbose=True,
+                            graphPath=None, checkpointEvery=120.0):
+    """
+    The visibility graph for these candidates, from disk if a matching one
+    is cached there, otherwise built (resuming from a partial build if one
+    was interrupted) and then saved.
+
+    graphPath : where to cache it. The partial-build checkpoint lives
+                alongside it as `<graphPath>.partial` and is deleted once
+                the full graph is saved. None disables both.
+    """
+    meta = vantageMeta(polygons, candidates, radius, nodeCapacity)
+    cached = _loadIfMeta(graphPath, meta, "visibility graph", verbose=verbose)
+    if cached is not None:
+        if verbose:
+            nEdges = sum(len(n) for n in cached.values()) // 2
+            print(f"Loaded visibility graph from {graphPath} "
+                  f"({len(cached)} vertices, {nEdges} edges)")
+        return cached
+
+    partialPath = (graphPath + ".partial") if graphPath else None
+    adjacency = buildVisibilityGraphRadiusBVH(
+        polygons, candidates, radius=radius, gridCell=gridCell,
+        node_capacity=nodeCapacity, processes=processes, verbose=verbose,
+        checkpointPath=partialPath, checkpointMeta=meta,
+        checkpointEvery=checkpointEvery)
+
+    if graphPath:
+        # store a plain dict: a defaultdict pickles its factory, and
+        # unpickling one silently creates entries on any later lookup miss
+        _atomicPickle(graphPath, {"meta": meta, "data": dict(adjacency)})
+        if verbose:
+            print(f"Saved visibility graph to {graphPath}")
+        if partialPath and os.path.exists(partialPath):
+            try:
+                os.unlink(partialPath)   # full graph saved; checkpoint obsolete
+            except OSError:
+                pass
+    return adjacency
+
+
+def loadOrPickVantageSeeds(polygons, candidates, n, radius, nodeCapacity=10,
+                           convexity=None, processes=None, verbose=True,
+                           seedsPath=None, graphPath=None,
+                           checkpointEvery=120.0):
+    """
+    The n vantage seeds for this dataset/radius, reusing as much prior work
+    as exists: the cached seeds file if the whole request matches, else the
+    cached (or resumable) graph, else a fresh build.
+
+    Returns [(vertex, degreeAtSelection), ...], the same shape
+    topKVantageVertices returns.
+    """
+    seedMeta = dict(vantageMeta(polygons, candidates, radius, nodeCapacity),
+                    n=int(n))
+    cached = _loadIfMeta(seedsPath, seedMeta, "vantage seeds", verbose=verbose)
+    if cached is not None:
+        if verbose:
+            print(f"Loaded {len(cached)} vantage seeds from {seedsPath}")
+        return cached
+
+    adjacency = loadOrBuildVantageGraph(
+        polygons, candidates, radius, nodeCapacity=nodeCapacity,
+        processes=processes, verbose=verbose, graphPath=graphPath,
+        checkpointEvery=checkpointEvery)
+    top = topKVantageVertices(adjacency, k=n, convexity=convexity)
+
+    if seedsPath:
+        _atomicPickle(seedsPath, {"meta": seedMeta, "data": top})
+        if verbose:
+            print(f"Saved {len(top)} vantage seeds to {seedsPath}")
+    return top
+
 
 def topKVantageVertices(adjacency, k=5, convexity=None):
     """

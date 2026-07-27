@@ -1,19 +1,38 @@
 # GIS Cup 2026 solver — configuration reference
 
-**Last updated 7/26/2026 4:40 PM EST**
+**Last updated 7/26/2026**
 
-Added file submission protection. Re-runs no longer override submissions.
+Added crash safety (mid-run checkpointing + resume), parallelized the swap
+refinement, and moved the per-(candidate, building) tables onto a packed
+numpy mirror of the viewshed cache. See **Crash safety & resume** and
+**Parallelism** below.
+
+Earlier: added file submission protection. Re-runs no longer override
+submissions.
 
 **IMPORTANT**
 
-All switches live at the top of `main/run_giscup.py` (experimental variants
-in `test/`). This file holds the prose:
+All switches live at the top of `main/run_giscup.py` (`test/` mirrors it —
+see below). This file holds the prose:
 what each one does, the measurements behind its default, and how the pieces
 interact. Crop benchmarks below refer to two cutouts of the sample dataset:
 **crop1** (605 buildings / 2,945 candidates) and **crop2** (1,855 / 10,168).
 The full sample dataset is 12,860 buildings / 78,727 candidates.
 
-Use `run_giscup.py` to run the program
+The 2026-07-26 performance work (parallelism, normalization, startup) was
+measured on its own cutouts — **338 buildings / 2,335 candidates** and
+**2,360 / 15,834** — which are *not* crop1/crop2; those figures name their
+sizes inline wherever they appear.
+
+Use `run_giscup.py` to run the program.
+
+`test/` holds the **submission** variant: the same solver plus
+`packageSubmission()`, which builds the contest-ready
+`submission_package.zip` (solution file + source folder + build/run
+instructions). Its three modules are otherwise a mirror of `main/` with the
+imports renamed (`lib_giscup` → `lib_test`, etc.), so **anything changed in
+`main/` has to be copied across** or the packaged submission ships stale
+code. `test/` is gitignored, so git will not warn you about the drift.
 
 Relavant switches to change:
 
@@ -26,6 +45,7 @@ Relavant switches to change:
 | `LOOKAHEAD_DEPTH`       |
 | `REFINE_MAX_ITERATIONS` |
 | `REFINE_TIME_BUDGET`    |
+| `REFINE_PROCESSES`      |
 | `VANTAGE_SEED_PERCENT`  |
 | `VANTAGE_RADIUS`        |
 
@@ -189,6 +209,38 @@ scale), so a high cap is affordable.
 on budget keeps everything found so far; worst-case total refine time is
 `9 × budget` regardless of τ/k regime.
 
+**`REFINE_PROCESSES`** — worker count for the **parallel swap scan**
+(`None` → `os.cpu_count()`, `0` → serial). Finding the best swap is the
+dominant cost of refinement, and it is now spread across cores in three
+stages per pass:
+
+1. the non-interacting pairs (exact closed form, `gains[a] - loss(r)`) are
+   resolved in the parent, establishing a delta floor;
+2. that floor feeds a **vectorized numpy upper bound** over every remaining
+   `(r, a)` pair at once — the same `gains[a] + |lossHit| - nLoss` bound the
+   serial scan uses, just evaluated as array math instead of a Python loop;
+3. whatever survives the bound is evaluated **exactly** by worker processes.
+
+Workers read candidate intervals from the memory-mapped packed viewshed
+(see below), never the multi-GB `viewCache`, which is what makes this fit in
+memory at all. Verification and commits stay in the parent, unchanged, so
+every committed swap is still exact-checked the same way.
+
+Measured on a 2,360-building / 15,834-candidate crop at τ=0.5, 12 workers:
+**2.7× at k=100, 1.9× at k=300**. (A k=800 run on that crop measured only
+1.08×, but it had already served 2,359 of 2,360 buildings — saturated, with
+no swaps left to find. It is not representative of the full dataset, where
+k=1000 covers 12,860 buildings.) The speedup is well under 12× because the
+bound-pruning stage and task hand-off stay serial; the win is on the
+pass scan, which is where the time actually goes. Because refinement is
+time-budgeted, a faster scan directly means **more committed swaps inside
+the same budget**, not just an earlier finish.
+
+Serial and parallel scans find the **same maximum delta every pass** (tested
+directly, 8 consecutive passes). They can still land on different local
+optima over a full run, because ties at that maximum are broken in a
+different order and the choice compounds — both are valid; neither regresses.
+
 `REFINE_VERBOSE` — per-swap log lines (predicted vs realized delta, running
 total, timings). The per-subcase summary prints either way.
 
@@ -223,6 +275,192 @@ Set to `0.0` to gamble on the evaluator counting exact-half coverage.
 
 ---
 
+## Crash safety & resume
+
+A full run is hours long, so nothing is held only in memory until the end.
+There are three independent recovery points; each one is written **during**
+the run, not after it.
+
+**Precompute checkpoints.** The viewshed precompute appends finished
+viewsheds to `cache/<name>.pkl.partial` every 2 minutes as one pickle frame
+per checkpoint. (Short on purpose: each viewshed is written exactly once
+regardless of interval, so checkpointing more often costs extra `fsync`
+calls but not extra bytes — while a long interval risks never firing at
+all, since the whole precompute is only ~6 min wall on 12 cores, and holds
+more finished work in RAM waiting to flush.) A restart loads it and re-sweeps only the candidates
+it does not already have. A frame torn by a crash mid-append is detected and
+skipped on load, so the file is always usable; the header frame records
+dataset fingerprint + radius + corridor reach, and a mismatch discards the
+checkpoint rather than resuming with wrong viewsheds. The `.partial` is
+deleted once the real cache is saved. The full cache itself is still written
+**before any solving starts** (unchanged, and it already used
+write-temp-then-`os.replace`), so the expensive stage is banked first.
+
+**Vantage seed / visibility-graph checkpoints.** The centrality graph build
+is the longest single stage in the pipeline (~22 min at radius 640), and it
+now protects itself the same way, plus caches its results:
+
+- finished vertices are appended to `cache/vantage_graph_*.pkl.partial` on
+  the same 2-minute cadence; a restart restores them and tests only the
+  vertices still missing (a resumed graph is byte-identical to one built in
+  one run — edges are re-applied symmetrically exactly as the builder does);
+- the finished graph is cached to `cache/vantage_graph_r{radius}_nc{n}.pkl`,
+  keyed on dataset + radius + node capacity, so later runs skip the build
+  entirely and a settings change is refused rather than silently reused;
+- the picked seeds are cached separately to `cache/vantage_seeds_*.pkl`,
+  keyed additionally by the seed **count**. A re-run with identical settings
+  loads that one small file and never touches the graph; a run that only
+  changes `VANTAGE_SEED_PERCENT` still reuses the cached graph.
+
+All writes are temp-file + `os.replace`, and the `.partial` is deleted once
+the real graph is saved.
+
+> **shapely is required for vantage seeding and is not currently installed.**
+> With `VANTAGE_SEED_PERCENT > 0` (it defaults to `0.01`) a run needs it.
+> Either `pip install shapely` or set `VANTAGE_SEED_PERCENT = 0`. The build
+> now checks for it up front and raises one clear message naming both
+> options — previously the import failed inside every worker, so the real
+> cause arrived buried under tens of thousands of lines of repeated
+> tracebacks. The check sits *after* the resume/cache logic, so a cached
+> graph or a fully-restored checkpoint still works without shapely at all.
+
+**Per-subcase submission writes.** `solve()` rewrites the submission after
+**every** verified subcase instead of once at the end. Writes go to a temp
+file and are `os.replace`d into position, so an interruption mid-write
+cannot truncate the file — the previous version survives intact.
+
+**Resume from a partial submission** (`RESUME_PARTIAL_SUBMISSION`, default
+on). On startup, if the highest-numbered `submission_N.txt` holds a strict
+subset of this run's τ×k grid — the signature of an interrupted run — those
+subcases are reused verbatim and the run continues into the same file,
+skipping the greedy entirely for any τ whose subcases are all present.
+Anything else starts a fresh numbered file, so **complete submissions stay
+protected exactly as before**: a finished file is never appended to, never
+overwritten, and a file that does not match the current `TAUS`/`KS` is left
+alone rather than half-reused.
+
+---
+
+## Parallelism
+
+What runs across CPU cores, and what deliberately does not:
+
+| stage                            | parallel?                                       |
+| -------------------------------- | ------------------------------------------------- |
+| viewshed precompute              | yes — `precomputeViewshedsParallel`, the big one |
+| validation coverage re-sweep     | yes — `localEvalCoverParallel`, one sweep/antenna |
+| visibility graph (vantage seeds) | yes — `buildVisibilityGraphRadiusBVH`            |
+| **refine swap scan**             | **yes — new, see `REFINE_PROCESSES`**            |
+| greedy / lookahead placement     | no — inherently sequential (see below)           |
+
+**Why placement is not parallelized.** Greedy and the lookahead are
+strictly sequential by construction: step *n+1*'s gains depend on what step
+*n* committed, which is the whole point of the submodular argument. The
+parallelizable work inside a step (scoring the beam) is already narrowed to
+`LOOKAHEAD_BEAM` candidates, and shipping the coverage state to workers per
+step would cost more than the scoring does. What made placement fast instead
+was removing redundant work across the nine subcases — see below.
+
+**Packed viewshed** (`cache/<name>_packed.*.npy`, built once, then
+memory-mapped). The pickled `viewCache` is nested dicts of tuples, roughly
+4× its ~1 GB disk size once unpickled — which is why refine workers could
+never each hold a copy. The packed mirror stores the identical intervals as
+flat CSR-style numpy arrays saved per-field, so every worker plus the parent
+share **one physical copy** through the OS page cache. Two per-(candidate,
+building) tables then come out of it as vectorized array reads instead of
+Python loops:
+
+- `extraLen` — the unmerged interval-length bound (same values
+  `buildExtraLen` produced, verified pair-for-pair);
+- `baseCov` — the **τ-independent** standalone merged coverage. This is the
+  bigger win: `_CoverageState.__init__` used to re-merge every (candidate,
+  building) pair on **every greedy call** — nine times per solve, for a
+  table that never changes. It is now computed once per cache.
+
+`buildingToCandidates` is likewise built once per solve and shared read-only,
+instead of being rebuilt inside every greedy, lookahead, and refine call.
+
+*Memory tradeoff, stated plainly:* `baseCov` is a new persistent table
+roughly the size of `extraLen`, and `buildingToCandidates` goes from
+transient-per-call to persistent — together a few hundred MB on the full
+dataset, on top of the unpickled `viewCache`. That is the price of the
+52.9× on state construction and of not rebuilding the same index nine
+times. Interval normalization gives most of it back (91% fewer interval
+tuples), and the packed arrays are memory-mapped rather than heap-resident.
+If you are ever memory-bound, `REFINE_PROCESSES = 0` drops the refine
+workers first.
+
+**Worker startup.** `lib_giscup` deliberately does **not** import matplotlib
+at module scope. On Windows every multiprocessing worker re-imports the
+module at spawn, and one solve creates ~19 pools (the precompute, plus a
+validation and a refine pool per subcase) × `cpu_count()` workers — none of
+which draw anything. Importing `matplotlib.pyplot` cost ~1.0 s per worker on
+top of numpy's 0.49 s; making it lazy took module import from **1.47 s to
+0.52 s (2.8×)**. `plt` and `MplPolygon` are still re-exported via PEP 562
+`__getattr__`, so `from lib_giscup import plt` keeps working and pulls
+matplotlib in only when a process actually touches it. `run_giscup` imports
+it inside the two plotting functions for the same reason — a module-level
+import there would be paid by every worker too, since spawn re-imports
+`__main__`.
+
+**Normalized intervals.** A sweep emits per-wedge interval *fragments* —
+averaging 11.6 per (candidate, building, edge), often adjacent or
+overlapping, since the corridor passes deliberately overlap at window
+boundaries. Every consumer already treats them as a union, so `normalizeView`
+now sorts and unions each list **once, when the viewshed is built**, instead
+of the union being re-derived inside each of the ~23 million coverage checks
+a solve performs.
+
+That invariant is what lets the hot path call `_addedLengthNorm`, which
+returns just the added length via a two-pointer walk — no merged list
+allocated, no baseline re-summed (`_covWithExtra` discarded that list
+anyway). Profiled on a 2,360-building crop, `_mergeIntervalsIncremental` was
+**53% of total lookahead time** (23.5M calls, 357 s of 669 s); the
+replacement measured **3.7× faster** on real cache intervals. Normalization
+also shrinks the cache, since fragments collapse into fewer tuples.
+
+A cache built before this change is **upgraded in place on load** (a
+union-preserving rewrite, then re-saved atomically) rather than rebuilt —
+no re-sweep, and future runs skip the pass. Packed files carry a matching
+flag so a stale one rebuilds. On the measured crop the collapse was
+**8,870,296 → 763,506 intervals (91% fewer)**, which is also a large memory
+saving.
+
+**On exactness.** Per-building coverage is bit-identical after
+normalization — verified, max difference exactly 0.0 across all 372,507
+(candidate, building) pairs. Two things do change, and they are worth
+keeping separate:
+
+1. **`extraLen` gets much tighter — a speed win, not a result change.**
+   That table is the *unmerged* fragment-length sum, so before
+   normalization it wildly overcounted overlap: the largest per-pair gap
+   measured was **424 m**. It is only ever used as a sound upper bound to
+   skip an exact coverage check (`baseVis + extraLen < tau·perim` ⇒ cannot
+   tip), and it stays sound either way, so a tighter value skips strictly
+   more work that could not have changed an answer. (`_covWithExtra`'s
+   `tauHint` short-circuit, the one path that would return a bound *as* a
+   coverage value, is never used — every caller applies the bound itself
+   and then asks for the exact figure.)
+
+2. **Summation order shifts results by ~1e-15.** Adding ~11.6 fragments
+   and adding their single merged union differ in the last bit, measured
+   at most **7.1e-15** per merge, accumulating a little further in the
+   coverage-sum tiebreak. This dataset is full of knife-edge cases (see
+   `CLAIM_MARGIN` — antennas seeing exactly two of four sides land at
+   exactly ½), so a 1e-15 nudge can flip one `>= tau` comparison or one
+   exact-equality tiebreak and send greedy down a different trajectory.
+
+So the pipeline is **not** bit-identical before and after — it is
+equivalent within float noise. Measured across 6 (τ, k) subcases, per-case
+served counts moved in both directions (−7 to +5) and the **totals came out
+exactly equal, 10,038 either way** — different local optima of equal
+quality, not a regression or a free win. Claim validity is unaffected:
+`CLAIM_MARGIN` (1e-6) is nine orders of magnitude above the perturbation,
+which is precisely the margin's purpose, and an independent re-sweep of the
+normalized solutions found **zero false claims**.
+
+---
+
 ## Vantage seeding
 
 `VANTAGE_SEED_PERCENT` — fraction of k placed first from visibility-graph
@@ -236,6 +474,12 @@ the draw as a **percentage of each subcase's k** is what made it work —
 keep it proportional.
 `VANTAGE_RADIUS`, `VANTAGE_NODE_CAPACITY`, `VANTAGE_PROCESSES` tune the
 graph build.
+
+The graph and the picked seeds are both cached to `cache/` and the build
+checkpoints as it runs, so that ~22 min is paid once rather than on every
+run or after every crash — see **Crash safety & resume**. Note that
+seeding requires **shapely**, which is not installed here; that section
+covers the options.
 
 ---
 
@@ -256,8 +500,15 @@ graph build.
 | precompute, plain r=160         | ~36 min single-core (÷ processes)                                           |
 | precompute, +1 doubling (→320)  | ~48 min single-core                                                         |
 | precompute, +2 doublings (→640) | ~77 min single-core                                                         |
-| shared `extraLen` table         | ~10 s, once per solve()                                                     |
+| shared per-pair tables          | built once per cache from the packed arrays, then reused by all 9 subcases  |
+| `_CoverageState` construction   | **7.82 s → 0.15 s (52.9×)** via the shared `baseCov` table, per greedy call |
+| coverage check (hot inner loop) | **3.7×** via normalized intervals + `_addedLengthNorm`                      |
+| worker process startup          | **1.47 s → 0.52 s (2.8×)** by not importing matplotlib in workers          |
 | greedy (incremental engine)     | 4.7–11.2× faster than the old rescan version, bit-identical sequences       |
 | lookahead depth 2 / 3           | ~2.3× / ~15× plain greedy per τ                                             |
-| refine                          | neighborhood-bounded per swap + per-subcase time budget                     |
+| refine swap scan                | **2.7× at k=100, 1.9× at k=300** on 12 workers; time-budgeted per subcase   |
 | validation                      | k antennas only; adaptive re-sweep one VALIDATION_STEP past the claim reach |
+
+Measured on a 2,360-building / 15,834-candidate crop unless noted. The three
+bolded rows are new; they compound, since every subcase pays the first two
+and the refine scan is where the wall-clock budget actually goes.
