@@ -46,7 +46,7 @@ GEOJSON_PATH = os.path.join(REPO_ROOT, "GIS-cup-sample-dataset.geojson")
 
 # -- radii / viewshed reach --------------------------------------------------
 SOLVE_RADIUS       = 80.0
-ADAPTIVE_DOUBLINGS = 3                     # corridor reach = SOLVE_RADIUS * 2**n; 0/None = off
+ADAPTIVE_DOUBLINGS = 5                     # corridor reach = SOLVE_RADIUS * 2**n; 0/None = off
 SOLVE_GRIDCELL     = SOLVE_RADIUS
 VALIDATION_STEP    = 1.25                  # validation re-sweep reach = claim reach * this;
                                            # > 1 so the re-sweep can both re-check claims
@@ -60,7 +60,7 @@ LOOKAHEAD_DEPTH        = 2                 # used when the gradient is None
 
 # -- refinement ---------------------------------------------------------------
 REFINE_WITH_SWAPS     = True
-REFINE_MAX_ITERATIONS = 1000                # cap on COMMITTED swaps
+REFINE_MAX_ITERATIONS = 10000                # cap on COMMITTED swaps
 REFINE_TIME_BUDGET    = 3600                # seconds per subcase; None = unlimited
 REFINE_VERBOSE        = True
 REFINE_PROCESSES      = None               # workers for the parallel swap-scan
@@ -80,7 +80,7 @@ CLAIM_MARGIN = 1e-6      # search, claim, and validate at tau + this, keeping
 
 # -- vantage seeding (centrality_alg.py) ---------------------------------------
 VANTAGE_SEED_PERCENT  = 0.01               # 0 = off (enables the faster slicing path)
-VANTAGE_RADIUS        = 320.0
+VANTAGE_RADIUS        = 1280.0
 VANTAGE_NODE_CAPACITY = 25
 VANTAGE_PROCESSES     = None               # None -> os.cpu_count()
 
@@ -308,7 +308,13 @@ def _pickVantageSeeds(polygons, convexity, n=0, radius=VANTAGE_RADIUS,
     # cache/. A re-run with the same settings loads the seeds outright; a
     # re-run with a different seed count reuses the graph; a run resumed
     # after a crash mid-build picks up from the checkpoint.
-    tag = f"r{int(radius)}_nc{int(nodeCapacity)}"
+    # Cache filenames encode exactly the settings the CONTENTS depend on --
+    # here just the radius (plus the seed count, on the seeds file only).
+    # VANTAGE_NODE_CAPACITY, gridCell and the process count are performance
+    # knobs that cannot change an edge, so they are deliberately absent from
+    # both the name and the metadata check (see vantageMeta): tuning them
+    # must not cost a 22-minute rebuild.
+    tag = f"r{int(radius)}"
     top = loadOrPickVantageSeeds(
         polygons, candidates, n=n, radius=radius, nodeCapacity=nodeCapacity,
         convexity=convexity, processes=processes, verbose=verbose,

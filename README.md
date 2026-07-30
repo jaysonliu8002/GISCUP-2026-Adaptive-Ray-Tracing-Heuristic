@@ -304,9 +304,9 @@ now protects itself the same way, plus caches its results:
   the same 2-minute cadence; a restart restores them and tests only the
   vertices still missing (a resumed graph is byte-identical to one built in
   one run — edges are re-applied symmetrically exactly as the builder does);
-- the finished graph is cached to `cache/vantage_graph_r{radius}_nc{n}.pkl`,
-  keyed on dataset + radius + node capacity, so later runs skip the build
-  entirely and a settings change is refused rather than silently reused;
+- the finished graph is cached to `cache/vantage_graph_r{radius}.pkl`, keyed
+  on dataset + radius, so later runs skip the build entirely and a settings
+  change is refused rather than silently reused;
 - the picked seeds are cached separately to `cache/vantage_seeds_*.pkl`,
   keyed additionally by the seed **count**. A re-run with identical settings
   loads that one small file and never touches the graph; a run that only
@@ -314,6 +314,27 @@ now protects itself the same way, plus caches its results:
 
 All writes are temp-file + `os.replace`, and the `.partial` is deleted once
 the real graph is saved.
+
+**What a cache is keyed on.** Every cache file's name and metadata carry
+exactly the settings its *contents* depend on, and nothing more — a knob
+that cannot change the result must never cost a rebuild:
+
+| cache | keyed on | deliberately **not** keyed on |
+|---|---|---|
+| `viewcache_r{radius}[_d{doublings}].pkl` | dataset, `SOLVE_RADIUS`, corridor reach (`maxRadius`) | `SOLVE_GRIDCELL`, process/chunk counts |
+| `viewcache_*_packed.*` | the viewshed cache it mirrors | as above |
+| `vantage_graph_r{radius}.pkl` | dataset, `VANTAGE_RADIUS` | `VANTAGE_NODE_CAPACITY`, grid cell, `VANTAGE_PROCESSES` |
+| `vantage_seeds_r{radius}_n{n}.pkl` | the above + seed count | as above |
+
+The excluded ones are pure performance knobs. `VANTAGE_NODE_CAPACITY` is
+the STRtree's leaf capacity: it changes the tree's shape, not which boxes
+a query returns. The grid cell sizes a bucketing structure whose hits are
+then filtered by an exact `distance² ≤ radius²` test. Process and chunk
+counts only divide identical work up differently, and edges are applied
+symmetrically, so the result is order-independent. Previously
+`VANTAGE_NODE_CAPACITY` *was* in both the graph's filename and its
+metadata, which meant retuning a BVH constant threw away a 22-minute
+build for no reason.
 
 > **shapely is required for vantage seeding and is not currently installed.**
 > With `VANTAGE_SEED_PERCENT > 0` (it defaults to `0.01`) a run needs it.

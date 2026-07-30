@@ -415,7 +415,9 @@ def buildVisibilityGraphRadiusBVH(polygons, candidates, radius, gridCell=None,
 #
 #  The visibility-graph build is the longest single stage in the pipeline
 #  (~22 min at radius 640 on the full dataset), and its result depends only
-#  on (dataset, radius, node_capacity) -- not on tau, k, or the seed count.
+#  on (dataset, radius) -- not on tau, k, the seed count, or any of the
+#  pure-performance knobs (node_capacity, gridCell, processes; see
+#  vantageMeta for why each is excluded from the cache key).
 #  So it is cached on disk exactly like the viewshed cache, with the same
 #  guarantees: metadata is verified on load, a mismatch is refused rather
 #  than silently reused, and writes go through a temp file + os.replace so
@@ -473,12 +475,29 @@ def _loadIfMeta(path, meta, what, verbose=True):
         return None
 
 
-def vantageMeta(polygons, candidates, radius, nodeCapacity):
-    """Identity of a visibility graph: everything its contents depend on."""
+def vantageMeta(polygons, candidates, radius):
+    """
+    Identity of a visibility graph: everything its CONTENTS depend on, and
+    nothing else. Two graphs with equal meta are equal graphs.
+
+    Deliberately EXCLUDED, because they are performance knobs that cannot
+    change a single edge -- keying on them would throw away a ~22-minute
+    build for a pure speed experiment:
+      nodeCapacity : STRtree leaf capacity. Changes the tree's SHAPE, not
+                     which boxes a query returns (the query is exhaustive
+                     either way).
+      gridCell     : candidate-bucket size for neighbor gathering. Every
+                     gathered pair is then filtered by the exact
+                     distance^2 <= radius^2 test, so the bucket size only
+                     changes how many pairs are examined and discarded.
+      processes /
+      chunksize    : how the identical per-vertex work is divided up.
+                     Edges are applied symmetrically and order-
+                     independently, so the result is the same either way.
+    """
     return {"fingerprint": _datasetFingerprint(polygons),
             "nCandidates": len(candidates),
-            "radius": float(radius),
-            "nodeCapacity": int(nodeCapacity)}
+            "radius": float(radius)}
 
 
 def loadOrBuildVantageGraph(polygons, candidates, radius, gridCell=None,
@@ -493,7 +512,7 @@ def loadOrBuildVantageGraph(polygons, candidates, radius, gridCell=None,
                 alongside it as `<graphPath>.partial` and is deleted once
                 the full graph is saved. None disables both.
     """
-    meta = vantageMeta(polygons, candidates, radius, nodeCapacity)
+    meta = vantageMeta(polygons, candidates, radius)
     cached = _loadIfMeta(graphPath, meta, "visibility graph", verbose=verbose)
     if cached is not None:
         if verbose:
@@ -535,8 +554,7 @@ def loadOrPickVantageSeeds(polygons, candidates, n, radius, nodeCapacity=10,
     Returns [(vertex, degreeAtSelection), ...], the same shape
     topKVantageVertices returns.
     """
-    seedMeta = dict(vantageMeta(polygons, candidates, radius, nodeCapacity),
-                    n=int(n))
+    seedMeta = dict(vantageMeta(polygons, candidates, radius), n=int(n))
     cached = _loadIfMeta(seedsPath, seedMeta, "vantage seeds", verbose=verbose)
     if cached is not None:
         if verbose:
