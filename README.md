@@ -1,19 +1,14 @@
 # GIS Cup 2026 solver — configuration reference
 
-**Last updated 7/26/2026**
+**Last updated 8/1/2026**
 
-Added crash safety (mid-run checkpointing + resume), parallelized the swap
-refinement, and moved the per-(candidate, building) tables onto a packed
-numpy mirror of the viewshed cache. See **Crash safety & resume** and
-**Parallelism** below.
-
-Earlier: added file submission protection. Re-runs no longer override
-submissions.
+Added settings as a config .py file and forced cpu parallel processing.
 
 **IMPORTANT**
 
-All switches live at the top of `main/run_giscup.py` (`test/` mirrors it —
-see below). This file holds the prose:
+All switches live in `main/settings.py` (`test/` mirrors it — see below).
+`run_giscup.py` is now purely a driver and defines no tunables of its own;
+it imports them from there. This file holds the prose:
 what each one does, the measurements behind its default, and how the pieces
 interact. Crop benchmarks below refer to two cutouts of the sample dataset:
 **crop1** (605 buildings / 2,945 candidates) and **crop2** (1,855 / 10,168).
@@ -21,7 +16,7 @@ The full sample dataset is 12,860 buildings / 78,727 candidates.
 
 The 2026-07-26 performance work (parallelism, normalization, startup) was
 measured on its own cutouts — **338 buildings / 2,335 candidates** and
-**2,360 / 15,834** — which are *not* crop1/crop2; those figures name their
+**2,360 / 15,834** — which are _not_ crop1/crop2; those figures name their
 sizes inline wherever they appear.
 
 Use `run_giscup.py` to run the program.
@@ -29,15 +24,18 @@ Use `run_giscup.py` to run the program.
 `test/` holds the **submission** variant: the same solver plus
 `packageSubmission()`, which builds the contest-ready
 `submission_package.zip` (solution file + source folder + build/run
-instructions). Its three modules are otherwise a mirror of `main/` with the
+instructions). Its modules are otherwise a mirror of `main/` with the
 imports renamed (`lib_giscup` → `lib_test`, etc.), so **anything changed in
 `main/` has to be copied across** or the packaged submission ships stale
-code. `test/` is gitignored, so git will not warn you about the drift.
+code — including the two modules added on 2026-08-01, `settings.py` and
+`compute.py`. `test/` is gitignored, so git will not warn you about the
+drift.
 
 Relavant switches to change:
 
 | switch                  |
 | ----------------------- |
+| `CPU_PROCESSES`         |
 | `SOLVE_RADIUS`          |
 | `ADAPTIVE_DOUBLINGS`    |
 | `VALIDATION_STEP`       |
@@ -45,9 +43,75 @@ Relavant switches to change:
 | `LOOKAHEAD_DEPTH`       |
 | `REFINE_MAX_ITERATIONS` |
 | `REFINE_TIME_BUDGET`    |
-| `REFINE_PROCESSES`      |
 | `VANTAGE_SEED_PERCENT`  |
 | `VANTAGE_RADIUS`        |
+
+---
+
+## Processing units
+
+Everything runs on **CPU cores**, across multiprocessing worker processes.
+One switch decides how many. `compute.py` resolves it once and every stage
+asks it, so it governs the whole program rather than one stage at a time.
+`solve()` prints the resolved count before it does any work.
+
+| `CPU_PROCESSES` | meaning                                                        |
+| --------------- | -------------------------------------------------------------- |
+| `None`          | every core on the machine                                      |
+| integer         | that many, **capped** at how many cores exist and floored at 1 |
+
+The clamp matters in both directions: asking for more processes than cores
+buys nothing and costs context-switching plus a full interpreter's memory per
+extra worker, while zero or negative would mean "no parallelism", which this
+pipeline has no path for.
+
+**Everything that can be parallel is parallel.** The old ways to turn
+parallelism off — `buildAndCacheViewsheds(parallel=False)`,
+`REFINE_PROCESSES = 0`, and the serial swap scan they selected — are gone,
+along with the per-stage `REFINE_PROCESSES` / `VANTAGE_PROCESSES` counts,
+which are now just `CPU_PROCESSES`.
+
+### Why there is no GPU backend
+
+One was built and removed on 2026-08-01. Recording the measurement so it does
+not get re-proposed from scratch:
+
+The pipeline has two kinds of parallel work, and they are not equally
+portable to a GPU.
+
+- **Array-shaped work** — the packed-viewshed build (`_segmentedUnionLengths`
+  and the derived `cbExtra`/`cbCov` tables) and the swap scan's gain-init
+  prune. Flat numpy, no data-dependent control flow; these _do_ port to CuPy
+  essentially unchanged, and a working CuPy backend for them was implemented
+  and verified.
+- **Everything that costs real time** — the visibility sweeps (viewshed
+  precompute, validation re-sweep, vantage graph) and the swap scan's exact
+  interval evaluation. Pure-Python geometry over dicts of tuples, with a
+  dynamically-ordered active edge set and data-dependent branching. There is
+  no GPU kernel for these and writing one is a _rewrite of the algorithm_,
+  not a port.
+
+The second group is where the hours go: precompute alone is ~36 min
+single-core at r=160 (~77 min at two doublings), the vantage graph ~22 min,
+and refinement is time-budgeted at 3600 s × 9 subcases. The array stages
+finish in seconds. So the GPU backend was accelerating a rounding error in
+the total, at the cost of a second numerical path, a CuPy dependency, and a
+whole vocabulary of "array stage / geometry stage / per-stage fallback"
+in the annotations. It was deleted and the array stages returned to plain
+numpy.
+
+**If you ever revisit it**, the only piece worth doing is the viewshed
+precompute, and it needs the sweep reformulated rather than ported: replace
+the O(E log E) angular sweep and its dynamic active set with brute-force
+angular-interval clipping — for each target edge, clip its angular span
+against every occluder in the local scene. That is O(E²) per candidate but
+branch-light, fixed-size output, and one thread per candidate across ~78,727
+independent candidates. Radius restriction already keeps local scenes to
+hundreds of edges, so the extra asymptotic work is plausibly bought back many
+times over. The validation re-sweep falls out of the same kernel for free.
+Nothing else is worth the complexity, and the greedy/lookahead placement loop
+is irreducibly sequential regardless (step _n+1_ depends on step _n_ — that
+is the submodular argument the whole approach rests on).
 
 ---
 
@@ -209,17 +273,22 @@ scale), so a high cap is affordable.
 on budget keeps everything found so far; worst-case total refine time is
 `9 × budget` regardless of τ/k regime.
 
-**`REFINE_PROCESSES`** — worker count for the **parallel swap scan**
-(`None` → `os.cpu_count()`, `0` → serial). Finding the best swap is the
-dominant cost of refinement, and it is now spread across cores in three
-stages per pass:
+**The parallel swap scan** — sized by `CPU_PROCESSES`, with no serial
+mode. Finding the best swap is the dominant cost of refinement, and it is
+spread across workers in three stages per pass:
 
 1. the non-interacting pairs (exact closed form, `gains[a] - loss(r)`) are
    resolved in the parent, establishing a delta floor;
-2. that floor feeds a **vectorized numpy upper bound** over every remaining
-   `(r, a)` pair at once — the same `gains[a] + |lossHit| - nLoss` bound the
-   serial scan uses, just evaluated as array math instead of a Python loop;
+2. that floor feeds a **vectorized upper bound** over every remaining
+   `(r, a)` pair at once — the same `gains[a] + |lossHit| - nLoss` bound,
+   evaluated as array math instead of a Python loop;
 3. whatever survives the bound is evaluated **exactly** by worker processes.
+
+Step 2 stays in the parent rather than being farmed out: these are
+per-removal-candidate slices of a few thousand entries evaluated thousands of
+times per pass, so shipping each to a worker would cost more in pickling than
+the arithmetic saves. Only the survivors — the ones needing the expensive
+exact interval math — are worth dispatching.
 
 Workers read candidate intervals from the memory-mapped packed viewshed
 (see below), never the multi-GB `viewCache`, which is what makes this fit in
@@ -236,10 +305,12 @@ pass scan, which is where the time actually goes. Because refinement is
 time-budgeted, a faster scan directly means **more committed swaps inside
 the same budget**, not just an earlier finish.
 
-Serial and parallel scans find the **same maximum delta every pass** (tested
-directly, 8 consecutive passes). They can still land on different local
-optima over a full run, because ties at that maximum are broken in a
-different order and the choice compounds — both are valid; neither regresses.
+The now-removed serial scan found the **same maximum delta every pass** as
+this one (tested directly, 8 consecutive passes); the two could still land on
+different local optima over a full run, because ties at that maximum broke in
+a different order and the choice compounds. That equivalence is why deleting
+it cost nothing but a second implementation of correctness-critical code to
+keep in sync.
 
 `REFINE_VERBOSE` — per-swap log lines (predicted vs realized delta, running
 total, timings). The per-subcase summary prints either way.
@@ -316,15 +387,15 @@ All writes are temp-file + `os.replace`, and the `.partial` is deleted once
 the real graph is saved.
 
 **What a cache is keyed on.** Every cache file's name and metadata carry
-exactly the settings its *contents* depend on, and nothing more — a knob
+exactly the settings its _contents_ depend on, and nothing more — a knob
 that cannot change the result must never cost a rebuild:
 
-| cache | keyed on | deliberately **not** keyed on |
-|---|---|---|
-| `viewcache_r{radius}[_d{doublings}].pkl` | dataset, `SOLVE_RADIUS`, corridor reach (`maxRadius`) | `SOLVE_GRIDCELL`, process/chunk counts |
-| `viewcache_*_packed.*` | the viewshed cache it mirrors | as above |
-| `vantage_graph_r{radius}.pkl` | dataset, `VANTAGE_RADIUS` | `VANTAGE_NODE_CAPACITY`, grid cell, `VANTAGE_PROCESSES` |
-| `vantage_seeds_r{radius}_n{n}.pkl` | the above + seed count | as above |
+| cache                                    | keyed on                                              | deliberately **not** keyed on                       |
+| ---------------------------------------- | ----------------------------------------------------- | --------------------------------------------------- |
+| `viewcache_r{radius}[_d{doublings}].pkl` | dataset, `SOLVE_RADIUS`, corridor reach (`maxRadius`) | `SOLVE_GRIDCELL`, process/chunk counts              |
+| `viewcache_*_packed.*`                   | the viewshed cache it mirrors                         | as above                                            |
+| `vantage_graph_r{radius}.pkl`            | dataset, `VANTAGE_RADIUS`                             | `VANTAGE_NODE_CAPACITY`, grid cell, `CPU_PROCESSES` |
+| `vantage_seeds_r{radius}_n{n}.pkl`       | the above + seed count                                | as above                                            |
 
 The excluded ones are pure performance knobs. `VANTAGE_NODE_CAPACITY` is
 the STRtree's leaf capacity: it changes the tree's shape, not which boxes
@@ -332,7 +403,7 @@ a query returns. The grid cell sizes a bucketing structure whose hits are
 then filtered by an exact `distance² ≤ radius²` test. Process and chunk
 counts only divide identical work up differently, and edges are applied
 symmetrically, so the result is order-independent. Previously
-`VANTAGE_NODE_CAPACITY` *was* in both the graph's filename and its
+`VANTAGE_NODE_CAPACITY` _was_ in both the graph's filename and its
 metadata, which meant retuning a BVH constant threw away a 22-minute
 build for no reason.
 
@@ -342,7 +413,7 @@ build for no reason.
 > now checks for it up front and raises one clear message naming both
 > options — previously the import failed inside every worker, so the real
 > cause arrived buried under tens of thousands of lines of repeated
-> tracebacks. The check sits *after* the resume/cache logic, so a cached
+> tracebacks. The check sits _after_ the resume/cache logic, so a cached
 > graph or a fully-restored checkpoint still works without shapely at all.
 
 **Per-subcase submission writes.** `solve()` rewrites the submission after
@@ -364,19 +435,23 @@ alone rather than half-reused.
 
 ## Parallelism
 
-What runs across CPU cores, and what deliberately does not:
+What is spread across worker processes, what is merely vectorized in the
+parent, and what deliberately is neither. Worker counts all come from
+`CPU_PROCESSES`.
 
-| stage                            | parallel?                                       |
-| -------------------------------- | ------------------------------------------------- |
-| viewshed precompute              | yes — `precomputeViewshedsParallel`, the big one |
-| validation coverage re-sweep     | yes — `localEvalCoverParallel`, one sweep/antenna |
-| visibility graph (vantage seeds) | yes — `buildVisibilityGraphRadiusBVH`            |
-| **refine swap scan**             | **yes — new, see `REFINE_PROCESSES`**            |
-| greedy / lookahead placement     | no — inherently sequential (see below)           |
+| stage                            | how                                                            |
+| -------------------------------- | -------------------------------------------------------------- |
+| viewshed precompute              | worker processes — `precomputeViewshedsParallel`, the big one  |
+| validation coverage re-sweep     | worker processes — `localEvalCoverParallel`, one sweep/antenna |
+| visibility graph (vantage seeds) | worker processes — `buildVisibilityGraphRadiusBVH`             |
+| refine swap scan (exact eval)    | worker processes on the mmap'd packed arrays                   |
+| packed-viewshed build            | vectorized in the parent — seconds, not worth splitting        |
+| refine swap scan (gain init)     | vectorized in the parent — one pass, then exact checks         |
+| greedy / lookahead placement     | neither — inherently sequential (see below)                    |
 
 **Why placement is not parallelized.** Greedy and the lookahead are
-strictly sequential by construction: step *n+1*'s gains depend on what step
-*n* committed, which is the whole point of the submodular argument. The
+strictly sequential by construction: step _n+1_'s gains depend on what step
+_n_ committed, which is the whole point of the submodular argument. The
 parallelizable work inside a step (scoring the beam) is already narrowed to
 `LOOKAHEAD_BEAM` candidates, and shipping the coverage state to workers per
 step would cost more than the scoring does. What made placement fast instead
@@ -401,15 +476,17 @@ Python loops:
 `buildingToCandidates` is likewise built once per solve and shared read-only,
 instead of being rebuilt inside every greedy, lookahead, and refine call.
 
-*Memory tradeoff, stated plainly:* `baseCov` is a new persistent table
+_Memory tradeoff, stated plainly:_ `baseCov` is a new persistent table
 roughly the size of `extraLen`, and `buildingToCandidates` goes from
 transient-per-call to persistent — together a few hundred MB on the full
 dataset, on top of the unpickled `viewCache`. That is the price of the
 52.9× on state construction and of not rebuilding the same index nine
 times. Interval normalization gives most of it back (91% fewer interval
 tuples), and the packed arrays are memory-mapped rather than heap-resident.
-If you are ever memory-bound, `REFINE_PROCESSES = 0` drops the refine
-workers first.
+If you are ever memory-bound, lower `CPU_PROCESSES` — every pool is sized
+from it, so fewer units means proportionally fewer resident workers. (The old
+`REFINE_PROCESSES = 0` escape hatch, which dropped the refine workers
+entirely by falling back to a serial scan, no longer exists.)
 
 **Worker startup.** `lib_giscup` deliberately does **not** import matplotlib
 at module scope. On Windows every multiprocessing worker re-imports the
@@ -424,7 +501,7 @@ it inside the two plotting functions for the same reason — a module-level
 import there would be paid by every worker too, since spawn re-imports
 `__main__`.
 
-**Normalized intervals.** A sweep emits per-wedge interval *fragments* —
+**Normalized intervals.** A sweep emits per-wedge interval _fragments_ —
 averaging 11.6 per (candidate, building, edge), often adjacent or
 overlapping, since the corridor passes deliberately overlap at window
 boundaries. Every consumer already treats them as a union, so `normalizeView`
@@ -453,13 +530,13 @@ normalization — verified, max difference exactly 0.0 across all 372,507
 keeping separate:
 
 1. **`extraLen` gets much tighter — a speed win, not a result change.**
-   That table is the *unmerged* fragment-length sum, so before
+   That table is the _unmerged_ fragment-length sum, so before
    normalization it wildly overcounted overlap: the largest per-pair gap
    measured was **424 m**. It is only ever used as a sound upper bound to
    skip an exact coverage check (`baseVis + extraLen < tau·perim` ⇒ cannot
    tip), and it stays sound either way, so a tighter value skips strictly
    more work that could not have changed an answer. (`_covWithExtra`'s
-   `tauHint` short-circuit, the one path that would return a bound *as* a
+   `tauHint` short-circuit, the one path that would return a bound _as_ a
    coverage value, is never used — every caller applies the bound itself
    and then asks for the exact figure.)
 
@@ -493,8 +570,8 @@ dataset in earlier runs). Historical note from testing: seeding with a
 **fixed** seed count (same n regardless of k) lost to plain greedy; sizing
 the draw as a **percentage of each subcase's k** is what made it work —
 keep it proportional.
-`VANTAGE_RADIUS`, `VANTAGE_NODE_CAPACITY`, `VANTAGE_PROCESSES` tune the
-graph build.
+`VANTAGE_RADIUS` and `VANTAGE_NODE_CAPACITY` tune the graph build; its worker
+count comes from `CPU_PROCESSES` like every other stage.
 
 The graph and the picked seeds are both cached to `cache/` and the build
 checkpoints as it runs, so that ~22 min is paid once rather than on every
@@ -524,7 +601,7 @@ covers the options.
 | shared per-pair tables          | built once per cache from the packed arrays, then reused by all 9 subcases  |
 | `_CoverageState` construction   | **7.82 s → 0.15 s (52.9×)** via the shared `baseCov` table, per greedy call |
 | coverage check (hot inner loop) | **3.7×** via normalized intervals + `_addedLengthNorm`                      |
-| worker process startup          | **1.47 s → 0.52 s (2.8×)** by not importing matplotlib in workers          |
+| worker process startup          | **1.47 s → 0.52 s (2.8×)** by not importing matplotlib in workers           |
 | greedy (incremental engine)     | 4.7–11.2× faster than the old rescan version, bit-identical sequences       |
 | lookahead depth 2 / 3           | ~2.3× / ~15× plain greedy per τ                                             |
 | refine swap scan                | **2.7× at k=100, 1.9× at k=300** on 12 workers; time-budgeted per subcase   |

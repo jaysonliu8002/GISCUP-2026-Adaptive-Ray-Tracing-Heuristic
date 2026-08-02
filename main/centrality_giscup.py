@@ -46,6 +46,8 @@ import os
 import pickle
 
 from collections import defaultdict
+
+import compute
 from lib_giscup import (EPS, pointInsidePolygon, buildScene,
                         _CheckpointWriter, _loadCheckpointPairs,
                         _datasetFingerprint)
@@ -241,7 +243,7 @@ def _radiusBVHEdgesTask(i):
     return u, visibleTo, len(others)
 
 def buildVisibilityGraphRadiusBVH(polygons, candidates, radius, gridCell=None,
-                                  node_capacity=10, processes=None, chunksize=20,
+                                  node_capacity=10, chunksize=20,
                                   progressEvery=None, verbose=True,
                                   checkpointPath=None, checkpointMeta=None,
                                   checkpointEvery=120.0):
@@ -259,7 +261,9 @@ def buildVisibilityGraphRadiusBVH(polygons, candidates, radius, gridCell=None,
                     capping option, nothing within radius is skipped here.
     gridCell      : bucket size for the candidate-point grid. Defaults to radius.
     node_capacity : STRtree leaf capacity, see buildVisibilityGraphLocalIndexed.
-    processes     : worker count, defaults to os.cpu_count().
+                    The worker count is not a parameter: like every other
+                    parallel stage it comes from compute.py
+                    (settings.CPU_PROCESSES).
     chunksize     : vertices per worker dispatch. Larger than the
                     unrestricted version's default (20 vs 4) since
                     per-vertex cost is much more UNIFORM here -- radius
@@ -289,13 +293,11 @@ def buildVisibilityGraphRadiusBVH(polygons, candidates, radius, gridCell=None,
 
     Returns {vertex: set(vertex, ...)} -- same shape as buildVisibilityGraph.
     """
-    import multiprocessing as mp
     import time
 
     if gridCell is None:
         gridCell = radius
-    if processes is None:
-        processes = os.cpu_count() or 1
+    processes = compute.unitCount()
     V = len(candidates)
     if progressEvery is None:
         progressEvery = max(1, V // 20)
@@ -360,9 +362,9 @@ def buildVisibilityGraphRadiusBVH(polygons, candidates, radius, gridCell=None,
 
     nTodo = len(todo)
     try:
-        with mp.Pool(processes=processes, initializer=_initRadiusBVHWorker,
-                     initargs=(polygons, candidates, radius, gridCell,
-                               node_capacity)) as pool:
+        with compute.workerPool(initializer=_initRadiusBVHWorker,
+                                initargs=(polygons, candidates, radius,
+                                          gridCell, node_capacity)) as pool:
             for u, visibleTo, nPairsInTask in pool.imap_unordered(
                     _radiusBVHEdgesTask, todo, chunksize=chunksize):
                 if processingStartTime is None:
@@ -501,7 +503,7 @@ def vantageMeta(polygons, candidates, radius):
 
 
 def loadOrBuildVantageGraph(polygons, candidates, radius, gridCell=None,
-                            nodeCapacity=10, processes=None, verbose=True,
+                            nodeCapacity=10, verbose=True,
                             graphPath=None, checkpointEvery=120.0):
     """
     The visibility graph for these candidates, from disk if a matching one
@@ -524,7 +526,7 @@ def loadOrBuildVantageGraph(polygons, candidates, radius, gridCell=None,
     partialPath = (graphPath + ".partial") if graphPath else None
     adjacency = buildVisibilityGraphRadiusBVH(
         polygons, candidates, radius=radius, gridCell=gridCell,
-        node_capacity=nodeCapacity, processes=processes, verbose=verbose,
+        node_capacity=nodeCapacity, verbose=verbose,
         checkpointPath=partialPath, checkpointMeta=meta,
         checkpointEvery=checkpointEvery)
 
@@ -543,7 +545,7 @@ def loadOrBuildVantageGraph(polygons, candidates, radius, gridCell=None,
 
 
 def loadOrPickVantageSeeds(polygons, candidates, n, radius, nodeCapacity=10,
-                           convexity=None, processes=None, verbose=True,
+                           convexity=None, verbose=True,
                            seedsPath=None, graphPath=None,
                            checkpointEvery=120.0):
     """
@@ -563,7 +565,7 @@ def loadOrPickVantageSeeds(polygons, candidates, n, radius, nodeCapacity=10,
 
     adjacency = loadOrBuildVantageGraph(
         polygons, candidates, radius, nodeCapacity=nodeCapacity,
-        processes=processes, verbose=verbose, graphPath=graphPath,
+        verbose=verbose, graphPath=graphPath,
         checkpointEvery=checkpointEvery)
     top = topKVantageVertices(adjacency, k=n, convexity=convexity)
 

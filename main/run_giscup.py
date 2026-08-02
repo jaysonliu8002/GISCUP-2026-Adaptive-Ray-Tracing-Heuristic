@@ -1,14 +1,20 @@
 """
 run_giscup.py — compute, validate, and plot for the GIS Cup 2026 solver.
  
-All reusable functions live in giscup_lib.py; this file is just the driver.
-Run the sections in order (or as notebook cells). Each section is self-contained
-and reads from files, so you can re-run validation/plotting without re-solving.
- 
-IMPORTANT (multiprocessing): the parallel precompute spawns worker processes
-that import giscup_lib. When running as a plain script, guard the entry point
-with `if __name__ == "__main__":` (done below). In Jupyter, parallel=True works
-because the workers import the installed giscup_lib module.
+All reusable functions live in lib_giscup.py and every adjustable option
+lives in settings.py; this file is just the driver. Run the sections in
+order (or as notebook cells). Each section is self-contained and reads from
+files, so you can re-run validation/plotting without re-solving.
+
+IMPORTANT (multiprocessing): the parallel stages spawn worker processes that
+import lib_giscup. When running as a plain script, guard the entry point with
+`if __name__ == "__main__":` (done below). In Jupyter this works because the
+workers import the installed lib_giscup module.
+
+Everything that can be parallel IS parallel, across CPU worker processes --
+there is no serial mode to fall back to. How many workers comes from
+settings.CPU_PROCESSES; solve() prints the resolved count before it does any
+work.
 """
  
 from lib_giscup import (
@@ -29,62 +35,24 @@ from datetime import datetime
 import os
 import time
 
-# Data files (dataset, cache/, submission/) live at the repo root, one level
-# above this script's folder, so anchor paths there instead of relying on the
-# current working directory.
-REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-
 # ---------------------------------------------------------------------------
-# Config -- every switch is documented in README.md, including the
-# measurements behind each default. Keep this block terse; put prose there.
+# Every adjustable option lives in settings.py -- including the worker count
+# the parallel stages use (CPU_PROCESSES, resolved by compute.py). This file
+# defines no tunables of its own; change behaviour there. Names are imported
+# flat so the code below reads the same as when they were module constants
+# here.
 # ---------------------------------------------------------------------------
-
-# -- problem ----------------------------------------------------------------
-TAUS = [0.25, 0.5, 0.75]
-KS   = [50, 500, 1000]
-GEOJSON_PATH = os.path.join(REPO_ROOT, "GIS-cup-sample-dataset.geojson")
-
-# -- radii / viewshed reach --------------------------------------------------
-SOLVE_RADIUS       = 80.0
-ADAPTIVE_DOUBLINGS = 5                     # corridor reach = SOLVE_RADIUS * 2**n; 0/None = off
-SOLVE_GRIDCELL     = SOLVE_RADIUS
-VALIDATION_STEP    = 1.25                  # validation re-sweep reach = claim reach * this;
-                                           # > 1 so the re-sweep can both re-check claims
-                                           # independently AND harvest extra true ones
-
-# -- main strategy ------------------------------------------------------------
-LOOKAHEAD_GREEDY       = True             # chess-style placement search (see README)
-LOOKAHEAD_BEAM         = 5                 # candidates given the deep evaluation per step
-LOOKAHEAD_DEPTH_BY_TAU = {0.25: 1, 0.5: 2, 0.75: 3}   # tau -> ply gradient; None = fixed
-LOOKAHEAD_DEPTH        = 2                 # used when the gradient is None
-
-# -- refinement ---------------------------------------------------------------
-REFINE_WITH_SWAPS     = True
-REFINE_MAX_ITERATIONS = 10000                # cap on COMMITTED swaps
-REFINE_TIME_BUDGET    = 3600                # seconds per subcase; None = unlimited
-REFINE_VERBOSE        = True
-REFINE_PROCESSES      = None               # workers for the parallel swap-scan
-                                           # (mmap'd packed viewshed, see README);
-                                           # None -> os.cpu_count(), 0 = serial
-
-# -- crash safety --------------------------------------------------------------
-RESUME_PARTIAL_SUBMISSION = True           # a partially-written submission_N.txt
-                                           # (crash mid-solve) is continued, not
-                                           # restarted; complete files stay
-                                           # protected as before
-
-# -- validation ---------------------------------------------------------------
-SKIP_REDUNDANT_VALIDATION = True
-CLAIM_MARGIN = 1e-6      # search, claim, and validate at tau + this, keeping
-                         # every claim clear of the knife edge (see README)
-
-# -- vantage seeding (centrality_alg.py) ---------------------------------------
-VANTAGE_SEED_PERCENT  = 0.01               # 0 = off (enables the faster slicing path)
-VANTAGE_RADIUS        = 1280.0
-VANTAGE_NODE_CAPACITY = 25
-VANTAGE_PROCESSES     = None               # None -> os.cpu_count()
-
-SUBMISSION_DIR = os.path.join(REPO_ROOT, "submission")
+import compute
+from settings import (
+    REPO_ROOT, CACHE_DIR, SUBMISSION_DIR,
+    TAUS, KS, GEOJSON_PATH,
+    SOLVE_RADIUS, ADAPTIVE_DOUBLINGS, SOLVE_GRIDCELL, VALIDATION_STEP,
+    LOOKAHEAD_GREEDY, LOOKAHEAD_BEAM, LOOKAHEAD_DEPTH_BY_TAU, LOOKAHEAD_DEPTH,
+    REFINE_WITH_SWAPS, REFINE_MAX_ITERATIONS, REFINE_TIME_BUDGET, REFINE_VERBOSE,
+    RESUME_PARTIAL_SUBMISSION,
+    SKIP_REDUNDANT_VALIDATION, CLAIM_MARGIN,
+    VANTAGE_SEED_PERCENT, VANTAGE_RADIUS, VANTAGE_NODE_CAPACITY,
+)
 
 def _submissionPath(n):
     return os.path.join(SUBMISSION_DIR, f"submission_{n}.txt")
@@ -292,8 +260,7 @@ def _shouldSkipCoverageRecheck():
 # ===========================================================================
 
 def _pickVantageSeeds(polygons, convexity, n=0, radius=VANTAGE_RADIUS,
-                      nodeCapacity=VANTAGE_NODE_CAPACITY, processes=VANTAGE_PROCESSES,
-                      verbose=True):
+                      nodeCapacity=VANTAGE_NODE_CAPACITY, verbose=True):
     if n <= 0:
         # Skip building the visibility graph entirely -- no point paying
         # for it just to discard the result.
@@ -310,16 +277,16 @@ def _pickVantageSeeds(polygons, convexity, n=0, radius=VANTAGE_RADIUS,
     # after a crash mid-build picks up from the checkpoint.
     # Cache filenames encode exactly the settings the CONTENTS depend on --
     # here just the radius (plus the seed count, on the seeds file only).
-    # VANTAGE_NODE_CAPACITY, gridCell and the process count are performance
-    # knobs that cannot change an edge, so they are deliberately absent from
-    # both the name and the metadata check (see vantageMeta): tuning them
-    # must not cost a 22-minute rebuild.
+    # VANTAGE_NODE_CAPACITY, gridCell and the processing-unit count are
+    # performance knobs that cannot change an edge, so they are deliberately
+    # absent from both the name and the metadata check (see vantageMeta):
+    # tuning them must not cost a 22-minute rebuild.
     tag = f"r{int(radius)}"
     top = loadOrPickVantageSeeds(
         polygons, candidates, n=n, radius=radius, nodeCapacity=nodeCapacity,
-        convexity=convexity, processes=processes, verbose=verbose,
-        seedsPath=os.path.join(REPO_ROOT, "cache", f"vantage_seeds_{tag}_n{n}.pkl"),
-        graphPath=os.path.join(REPO_ROOT, "cache", f"vantage_graph_{tag}.pkl"))
+        convexity=convexity, verbose=verbose,
+        seedsPath=os.path.join(CACHE_DIR, f"vantage_seeds_{tag}_n{n}.pkl"),
+        graphPath=os.path.join(CACHE_DIR, f"vantage_graph_{tag}.pkl"))
     if verbose:
         print(f"Vantage seeds ({len(top)}/{n} requested):")
         for v, deg in top:
@@ -410,6 +377,14 @@ def _printSummaryTable(rows):
 def solve(seed=0):
     solveStart = time.perf_counter()
 
+    # What we are about to run on, before any work happens -- resolved from
+    # settings.CPU_PROCESSES, so this reports the workers actually in use
+    # after the clamp, not what was asked for. Printed first so a run that
+    # is quietly single-core is obvious from line one of the log rather
+    # than inferred from the timings.
+    for line in compute.describe():
+        _log(line)
+
     polygons, ids = _timed("loadGeoJSON", loadGeoJSON, GEOJSON_PATH)
     idToIndex = {bid: i for i, bid in enumerate(ids)}
     onAnyBoundary = _timed("_buildBoundaryChecker", _buildBoundaryChecker, polygons)
@@ -417,7 +392,7 @@ def solve(seed=0):
     # build once or load from disk (the precompute checkpoints itself to a
     # .partial file every few minutes and resumes from it after a crash;
     # the finished cache is saved to disk BEFORE any solving starts)
-    cacheBase = os.path.join(REPO_ROOT, "cache",
+    cacheBase = os.path.join(CACHE_DIR,
                              f"viewcache_r{int(SOLVE_RADIUS)}"
                              + (f"_d{ADAPTIVE_DOUBLINGS}" if _adaptiveMax() else ""))
     candidates, viewCache, perim = _timed(
@@ -436,11 +411,12 @@ def solve(seed=0):
                                 baseCovFromPacked, candidates, packed)
     _SHARED["btc"] = _timed("buildBuildingToCandidates (shared index)",
                             buildBuildingToCandidates, candidates, viewCache)
-    if REFINE_WITH_SWAPS and (REFINE_PROCESSES is None or REFINE_PROCESSES > 0):
+    if REFINE_WITH_SWAPS:
+        # Not optional any more: the swap scan has no serial mode, so this
+        # context is built whenever refinement runs at all.
         _SHARED["refineCtx"] = _timed(
             "buildRefineParallelContext (parallel swap-scan)",
-            buildRefineParallelContext, candidates, cacheBase + "_packed",
-            REFINE_PROCESSES)
+            buildRefineParallelContext, candidates, cacheBase + "_packed")
     else:
         _SHARED.pop("refineCtx", None)
 
@@ -486,7 +462,7 @@ def solve(seed=0):
         vantageSeedsPool = _timed(
             "_pickVantageSeeds", _pickVantageSeeds,
             polygons, convexity, n=poolSize, radius=VANTAGE_RADIUS,
-            nodeCapacity=VANTAGE_NODE_CAPACITY, processes=VANTAGE_PROCESSES)
+            nodeCapacity=VANTAGE_NODE_CAPACITY)
     else:
         vantageSeedsPool = []
 

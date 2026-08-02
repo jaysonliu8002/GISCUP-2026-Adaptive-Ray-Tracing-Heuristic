@@ -11,7 +11,10 @@ Contents
   Greedy ......... candidateViewshed, greedyCornersCached, polygonPerimeter,
                    servicedIdsFromViewCache
   Parallel ....... precomputeViewshedsParallel, localEvalCoverParallel
-                   (CPU multiprocessing)
+                   Every parallel stage is unconditionally parallel -- there
+                   is no serial mode to fall back to -- and gets its worker
+                   count from compute.py (settings.CPU_PROCESSES), never
+                   from os.cpu_count() here.
   Viewshed cache . candidateList, loadOrBuildViewsheds, buildAndCacheViewsheds,
                    saveViewCache, loadViewCache
 """
@@ -23,6 +26,8 @@ import os
 import time
 import numpy as np
 from collections import defaultdict
+
+import compute
 
 # matplotlib is NOT imported at module scope, and must not be: on Windows
 # every multiprocessing worker re-imports this module at spawn, and a solve
@@ -1568,8 +1573,13 @@ def refineWithSwaps(polygons, placed, tau, candidates, viewCache,
 Parallel viewshed precompute for greedy antenna placement.
 
 The precompute (one visibility sweep per candidate vertex) is embarrassingly
-parallel — each candidate is independent. This module runs it across CPU cores
-with multiprocessing. No GPU involved; this is CPU-core parallelism.
+parallel — each candidate is independent, and it always runs in parallel
+(there is no serial path). Worker count comes from compute.unitCount().
+
+This is the single most expensive stage in the pipeline (~36 min
+single-core at r=160 on the full dataset, ~77 min at two doublings), which
+is why it is also the one worth understanding before optimizing anything
+else.
 
 Usage:
     from greedy_parallel import precomputeViewshedsParallel
@@ -1721,13 +1731,15 @@ def _loadCheckpointPairs(path, meta, verbose=True):
 
 
 def precomputeViewshedsParallel(polygons, candidates, radius=80.0, gridCell=80.0,
-                                processes=None, chunksize=50, verbose=True,
+                                chunksize=50, verbose=True,
                                 maxRadius=None, checkpointPath=None,
                                 checkpointMeta=None, checkpointEvery=120.0,
                                 precomputed=None):
     """
-    Compute every candidate's viewshed across CPU cores.
-    Returns {candidate: {bldgIdx: {edgeIdx: [intervals]}}}, same as the serial cache.
+    Compute every candidate's viewshed across the configured processing
+    units (see compute.py; this is a geometry stage, so CPU worker
+    processes under either backend).
+    Returns {candidate: {bldgIdx: {edgeIdx: [intervals]}}}.
 
     Crash safety (all optional, off when checkpointPath is None):
       precomputed     : {candidate: view} already computed in an earlier,
@@ -1742,23 +1754,21 @@ def precomputeViewshedsParallel(polygons, candidates, radius=80.0, gridCell=80.0
                         fingerprint + radii) so a stale checkpoint from a
                         different dataset/config is refused on load.
     """
-    import multiprocessing as mp
-    if processes is None:
-        processes = os.cpu_count() or 1
     viewCache = dict(precomputed) if precomputed else {}
     todo = [c for c in candidates if c not in viewCache] if viewCache else list(candidates)
     if verbose:
         skipNote = f" ({len(viewCache)} restored from checkpoint)" if viewCache else ""
-        print(f"Precomputing {len(todo)} viewsheds across {processes} processes...{skipNote}")
+        print(f"Precomputing {len(todo)} viewsheds across "
+              f"{compute.unitCount()} processes...{skipNote}")
     if not todo:
         return viewCache
 
     ck = (_CheckpointWriter(checkpointPath, checkpointMeta, checkpointEvery)
           if checkpointPath is not None else None)
     try:
-        with mp.Pool(processes=processes,
-                     initializer=_initWorker,
-                     initargs=(polygons, radius, gridCell, maxRadius)) as pool:
+        with compute.workerPool(initializer=_initWorker,
+                                initargs=(polygons, radius, gridCell,
+                                          maxRadius)) as pool:
             done = 0
             for antenna, view in pool.imap_unordered(_viewshedTask, todo,
                                                       chunksize=chunksize):
@@ -1807,26 +1817,24 @@ def parseSubmission(path):
 # ===========================================================================
 
 def localEvalCoverParallel(antennas, polygons, radius=80.0, gridCell=80.0,
-                           processes=None, chunksize=8, maxRadius=None):
+                           chunksize=8, maxRadius=None):
     """
     Coverage fraction per building for a given antenna list, computed in
-    parallel across CPU cores (one sweep per antenna, merged across workers).
+    parallel (one sweep per antenna, merged across workers), with the
+    worker count from compute.unitCount().
     Returns {buildingIndex: coverageFraction}.
 
     Note: builds its own grid inside each worker (via _initWorker), so you pass
     polygons/radius/gridCell rather than a prebuilt grid.
     """
-    import multiprocessing as mp
-    if processes is None:
-        processes = os.cpu_count() or 1
     if not antennas:
         return {}
 
     accum = {}   # globalBldgIdx -> {edgeIdx: [intervals]}
 
-    with mp.Pool(processes=processes,
-                 initializer=_initWorker,
-                 initargs=(polygons, radius, gridCell, maxRadius)) as pool:
+    with compute.workerPool(initializer=_initWorker,
+                            initargs=(polygons, radius, gridCell,
+                                      maxRadius)) as pool:
         for antenna, view in pool.imap_unordered(_viewshedTask, antennas,
                                                   chunksize=chunksize):
             # view: {globalBldgIdx: {edgeIdx: [intervals]}}
@@ -1891,10 +1899,14 @@ def _datasetFingerprint(polygons):
 
 
 def buildAndCacheViewsheds(polygons, radius=80.0, gridCell=80.0, path=None,
-                           parallel=True, verbose=True, maxRadius=None):
+                           verbose=True, maxRadius=None):
     """
     Build the viewshed cache (candidates + perimeters + viewsheds) and, if a
     path is given, save it to disk. Returns (candidates, viewCache, perim).
+
+    Always parallel -- the old `parallel=False` single-core loop is gone.
+    It computed the identical cache tens of times slower and existed only
+    as a debugging fallback; compute.py now decides the unit count.
     """
     candidates = candidateList(polygons)
     perim = {i: polygonPerimeter(p) for i, p in enumerate(polygons)}
@@ -1911,25 +1923,12 @@ def buildAndCacheViewsheds(polygons, radius=80.0, gridCell=80.0, path=None,
                                         verbose=verbose)
                    if partialPath else {})
 
-    if parallel:
-        viewCache = precomputeViewshedsParallel(polygons, candidates,
-                                                radius=radius, gridCell=gridCell,
-                                                verbose=verbose, maxRadius=maxRadius,
-                                                checkpointPath=partialPath,
-                                                checkpointMeta=checkpointMeta,
-                                                precomputed=precomputed)
-    else:
-        grid = SpatialGrid(polygons, cell=gridCell)
-        viewCache = dict(precomputed)
-        adaptive = maxRadius is not None and maxRadius > radius
-        for i, c in enumerate(candidates):
-            if c in viewCache:
-                continue
-            viewCache[c] = (candidateViewshedAdaptive(c, polygons, grid, radius, maxRadius)
-                            if adaptive else
-                            candidateViewshed(c, polygons, grid, radius))
-            if verbose and (i + 1) % 5000 == 0:
-                print(f"  {i+1}/{len(candidates)}")
+    viewCache = precomputeViewshedsParallel(polygons, candidates,
+                                            radius=radius, gridCell=gridCell,
+                                            verbose=verbose, maxRadius=maxRadius,
+                                            checkpointPath=partialPath,
+                                            checkpointMeta=checkpointMeta,
+                                            precomputed=precomputed)
 
     if path is not None:
         saveViewCache(path, polygons, radius, candidates, viewCache, perim,
@@ -2028,7 +2027,7 @@ def loadViewCache(path, polygons, radius, maxRadius=None):
 
 
 def loadOrBuildViewsheds(polygons, radius=80.0, gridCell=80.0, path="viewcache.pkl",
-                         parallel=True, verbose=True, maxRadius=None):
+                         verbose=True, maxRadius=None):
     """
     Convenience: load the cache from `path` if it exists and matches; otherwise
     build it and save it. Returns (candidates, viewCache, perim).
@@ -2066,8 +2065,7 @@ def loadOrBuildViewsheds(polygons, radius=80.0, gridCell=80.0, path="viewcache.p
             if verbose:
                 print(f"Cache at {path} unusable ({e}); rebuilding.")
     return buildAndCacheViewsheds(polygons, radius, gridCell, path,
-                                  parallel=parallel, verbose=verbose,
-                                  maxRadius=maxRadius)
+                                  verbose=verbose, maxRadius=maxRadius)
 
 # ===========================================================================
 #  PACKED VIEWSHED  (compact numpy mirror of the viewCache)
@@ -2186,6 +2184,12 @@ def buildPackedViewshed(candidates, viewCache, perim, nBuildings, verbose=True):
 
     perimArr = np.array([perim[i] for i in range(nBuildings)], dtype=np.float64)
 
+    # ---- derived per-(candidate, building) tables ----
+    # Vectorized rather than parallelized on purpose: this is one pass of
+    # flat-array numpy over the whole cache, and it runs in seconds against
+    # the tens of minutes the sweeps cost. Splitting it across processes
+    # would spend more on pickling the arrays than on the arithmetic.
+
     # unmerged per-(c,b) sums: segment-local reduceat, no long cumsums
     cbIvStart = cbeIvPtr[cbEdgePtr[:-1]] if iCB else np.zeros(0, dtype=np.int64)
     cbExtra = (np.add.reduceat(ivHi - ivLo, cbIvStart)
@@ -2303,19 +2307,21 @@ def buildBuildingToCandidates(candidates, viewCache):
     return d
 
 
-def buildRefineParallelContext(candidates, packedPrefix, processes=None):
-    """Everything refineWithSwapsV2 needs to run its pass scan across CPU
-    cores. Built once per solve, reused by every refine call.
+def buildRefineParallelContext(candidates, packedPrefix):
+    """Everything refineWithSwapsV2 needs to run its pass scan in parallel.
+    Built once per solve, reused by every refine call. REQUIRED -- the scan
+    has no serial mode any more, so refineWithSwapsV2 raises without this.
 
       candidates   : the cache's candidate list (defines packed indices)
       packedPrefix : prefix the packed .npy files were saved under
-      processes    : worker count (None -> os.cpu_count(), 0 disables)
+
+    The worker count comes from compute.py, not from a parameter -- there
+    is one knob for the whole program now.
 
     Contents: the mmap'd packed arrays, candidate->index map, and a
     building->candidate-index CSR (for fast per-pass loss-hit counting).
     """
-    if processes is None:
-        processes = os.cpu_count() or 1
+    processes = compute.unitCount()
     packed = loadPackedViewshed(packedPrefix, mmapMode="r")
     candIndex = {c: i for i, c in enumerate(candidates)}
     cb = np.asarray(packed["cbBuilding"])
@@ -2473,17 +2479,19 @@ def refineWithSwapsV2(polygons, placed, tau, candidates, viewCache,
     Local-search swap refinement over the COMPLETE (remove r, add a) space,
     with verified commits and an INCREMENTAL pass engine.
 
-    parallelCtx : optional buildRefineParallelContext(...) result. When
-    given (and its process count > 0), each pass's expensive (r, a) scan
-    runs ACROSS CPU CORES: a vectorized numpy upper bound first prunes the
-    pair space in the parent (same bound as the serial scan), then the
+    parallelCtx : REQUIRED buildRefineParallelContext(...) result. Each
+    pass's expensive (r, a) scan runs in parallel, always: a vectorized
+    numpy upper bound first prunes the pair space in the parent, then the
     surviving pairs are evaluated exactly by worker processes that read
     candidate intervals from the memory-mapped packed viewshed (one
-    physical copy shared by all workers -- workers never hold the
-    multi-GB viewCache). Verification and commits stay in the parent,
-    unchanged, so every committed swap is still exact-checked the same
-    way. Results can differ from the serial scan only in which of several
-    equally-good swaps gets picked first.
+    physical copy shared by all workers -- workers never hold the multi-GB
+    viewCache). Verification and commits stay in the parent, so every
+    committed swap is still exact-checked the same way.
+
+    The old serial scan is gone. It computed the same maximum delta every
+    pass (that equivalence was tested and is documented in README) at a
+    fraction of the throughput, and keeping two implementations of the
+    correctness-critical scan in sync was the real cost.
 
     buildingToCands : optional shared buildBuildingToCandidates() result
     (read-only), so repeated calls skip rebuilding it.
@@ -2518,45 +2526,44 @@ def refineWithSwapsV2(polygons, placed, tau, candidates, viewCache,
 
     committedView = {c: viewCache[c] for c in placed}
 
-    useParallel = bool(parallelCtx) and parallelCtx.get("processes", 0) > 0
-    pool = None
-    if useParallel:
-        _pk = parallelCtx["packed"]
-        _candIndex = parallelCtx["candIndex"]
-        _candList = parallelCtx["candidates"]
-        _pkCandPtr = np.asarray(_pk["candPtr"])
-        _pkCbB = np.asarray(_pk["cbBuilding"])
-        _bToCandFlat = parallelCtx["bToCandFlat"]
-        _bToCandPtr = parallelCtx["bToCandPtr"]
-        nProcs = parallelCtx["processes"]
-        viewSet = None                      # packed arrays replace it
+    if not parallelCtx:
+        raise ValueError(
+            "refineWithSwapsV2 requires parallelCtx (the swap scan is always "
+            "parallel now -- build one with buildRefineParallelContext).")
 
-        def _candSlice(i):
-            return int(_pkCandPtr[i]), int(_pkCandPtr[i + 1])
+    _pk = parallelCtx["packed"]
+    _candIndex = parallelCtx["candIndex"]
+    _candList = parallelCtx["candidates"]
+    _pkCandPtr = np.asarray(_pk["candPtr"])
+    _pkCbB = np.asarray(_pk["cbBuilding"])
+    _bToCandFlat = parallelCtx["bToCandFlat"]
+    _bToCandPtr = parallelCtx["bToCandPtr"]
+    nProcs = parallelCtx["processes"]
 
-        def _seesB(i, b):
-            lo, hi = _candSlice(i)
-            j = lo + int(np.searchsorted(_pkCbB[lo:hi], b))
-            return j < hi and int(_pkCbB[j]) == b
+    def _candSlice(i):
+        return int(_pkCandPtr[i]), int(_pkCandPtr[i + 1])
 
-        def _seesAnyOf(a, bset):
-            if not bset:
-                return False
-            lo, hi = _candSlice(_candIndex[a])
-            if hi == lo:
-                return False
-            sub = _pkCbB[lo:hi]
-            arr = np.fromiter(bset, dtype=np.int64, count=len(bset))
-            pos = np.searchsorted(sub, arr)
-            valid = pos < (hi - lo)
-            return bool(np.any(sub[pos[valid]] == arr[valid]))
+    def _seesB(i, b):
+        lo, hi = _candSlice(i)
+        j = lo + int(np.searchsorted(_pkCbB[lo:hi], b))
+        return j < hi and int(_pkCbB[j]) == b
 
-        import multiprocessing as mp
-        pool = mp.Pool(processes=nProcs,
-                       initializer=_initRefinePackedWorker,
-                       initargs=(parallelCtx["prefix"],))
-    else:
-        viewSet = {c: frozenset(viewCache[c].keys()) for c in candidates}
+    def _seesAnyOf(a, bset):
+        if not bset:
+            return False
+        lo, hi = _candSlice(_candIndex[a])
+        if hi == lo:
+            return False
+        sub = _pkCbB[lo:hi]
+        arr = np.fromiter(bset, dtype=np.int64, count=len(bset))
+        pos = np.searchsorted(sub, arr)
+        valid = pos < (hi - lo)
+        return bool(np.any(sub[pos[valid]] == arr[valid]))
+
+    import multiprocessing as mp
+    pool = mp.Pool(processes=nProcs,
+                   initializer=_initRefinePackedWorker,
+                   initargs=(parallelCtx["prefix"],))
 
     # static upper-bound helper: total (unmerged) interval length candidate c
     # contributes to building b -- baseVis + extraLen is a sound upper bound
@@ -2619,24 +2626,17 @@ def refineWithSwapsV2(polygons, placed, tau, candidates, viewCache,
     for r in placedSet:
         refreshBaseline(r, committedViewSets[r])
 
-    poolCache = {}   # r -> candidates sharing >=1 building with r
-                     # (tuple of vertices serially; sorted ndarray of
-                     #  candidate INDICES in parallel mode)
+    poolCache = {}   # r -> sorted ndarray of the packed INDICES of the
+                     # candidates sharing >= 1 building with r
 
     def buildPool(r):
-        if useParallel:
-            bs = committedViewSets[r]
-            if bs:
-                parts = [_bToCandFlat[_bToCandPtr[b]:_bToCandPtr[b + 1]]
-                         for b in bs]
-                poolCache[r] = np.unique(np.concatenate(parts))
-            else:
-                poolCache[r] = np.zeros(0, dtype=np.int64)
-            return
-        poolMembers = set()
-        for b in committedViewSets[r]:
-            poolMembers |= buildingToCandidates.get(b, set())
-        poolCache[r] = tuple(poolMembers)
+        bs = committedViewSets[r]
+        if bs:
+            parts = [_bToCandFlat[_bToCandPtr[b]:_bToCandPtr[b + 1]]
+                     for b in bs]
+            poolCache[r] = np.unique(np.concatenate(parts))
+        else:
+            poolCache[r] = np.zeros(0, dtype=np.int64)
 
     for r in placedSet:
         buildPool(r)
@@ -2657,59 +2657,56 @@ def refineWithSwapsV2(polygons, placed, tau, candidates, viewCache,
                              viewCache[a].get(b), pb) >= tau
 
     def computeGain(a):
-        if viewSet is not None:
-            touched = viewSet[a] & unservedSet
-        else:
-            lo, hi = _candSlice(_candIndex[a])
-            touched = [b for b in _pkCbB[lo:hi].tolist() if b in unservedSet]
+        lo, hi = _candSlice(_candIndex[a])
+        touched = [b for b in _pkCbB[lo:hi].tolist() if b in unservedSet]
         t = {b for b in touched if _tips(a, b)}
         aTips[a] = t
         gains[a] = len(t)
 
-    if useParallel:
-        # Vectorized gain init: ONE numpy upper-bound filter over every
-        # (candidate, building) pair in the packed arrays, exact _tips
-        # checks only on the survivors -- replaces the python loop over
-        # all candidates (same bound _tips applies, so survivors match).
-        nB = len(_pk["perim"])
-        visArr = np.zeros(nB)
-        for b, v in globalVis.items():
-            visArr[b] = v
-        perimArr = np.asarray(_pk["perim"])
-        unservedArr = np.zeros(nB, dtype=bool)
-        if unservedSet:
-            unservedArr[np.fromiter(unservedSet, dtype=np.int64,
-                                    count=len(unservedSet))] = True
-        pbAll = perimArr[_pkCbB]
-        mask = unservedArr[_pkCbB] & (pbAll >= 1e-9)
-        mask &= (visArr[_pkCbB] + np.asarray(_pk["cbExtra"])) >= tau * pbAll
-        survivors = np.flatnonzero(mask)
-        for a in remaining:
-            aTips[a] = set()
-            gains[a] = 0
-        if len(survivors):
-            candOf = (np.searchsorted(_pkCandPtr, survivors, side="right") - 1)
-            bList = np.asarray(_pkCbB)[survivors].tolist()
-            cList = candOf.tolist()
-            prevC = -1
-            curA = None
-            inRem = False
-            for pos in range(len(cList)):
-                ci = cList[pos]
-                if ci != prevC:
-                    prevC = ci
-                    curA = _candList[ci]
-                    inRem = curA in remaining
-                if not inRem:
-                    continue
-                b = bList[pos]
-                if _tips(curA, b):
-                    aTips[curA].add(b)
-            for a, t in aTips.items():
-                gains[a] = len(t)
-    else:
-        for a in remaining:
-            computeGain(a)
+    # Vectorized gain init: ONE numpy upper-bound filter over every
+    # (candidate, building) pair in the packed arrays, exact _tips
+    # checks only on the survivors -- replaces a python loop over
+    # all candidates (same bound _tips applies, so survivors match).
+    # The largest single array operation in the solver, and the reason
+    # this stage is vectorized rather than farmed out: the mask is a
+    # handful of full-array passes, while the surviving _tips checks are
+    # the part that actually costs anything.
+    nB = len(_pk["perim"])
+    visArr = np.zeros(nB)
+    for b, v in globalVis.items():
+        visArr[b] = v
+    perimArr = np.asarray(_pk["perim"])
+    unservedArr = np.zeros(nB, dtype=bool)
+    if unservedSet:
+        unservedArr[np.fromiter(unservedSet, dtype=np.int64,
+                                count=len(unservedSet))] = True
+    pbAll = perimArr[_pkCbB]
+    mask = unservedArr[_pkCbB] & (pbAll >= 1e-9)
+    mask &= (visArr[_pkCbB] + np.asarray(_pk["cbExtra"])) >= tau * pbAll
+    survivors = np.flatnonzero(mask)
+    for a in remaining:
+        aTips[a] = set()
+        gains[a] = 0
+    if len(survivors):
+        candOf = (np.searchsorted(_pkCandPtr, survivors, side="right") - 1)
+        bList = np.asarray(_pkCbB)[survivors].tolist()
+        cList = candOf.tolist()
+        prevC = -1
+        curA = None
+        inRem = False
+        for pos in range(len(cList)):
+            ci = cList[pos]
+            if ci != prevC:
+                prevC = ci
+                curA = _candList[ci]
+                inRem = curA in remaining
+            if not inRem:
+                continue
+            b = bList[pos]
+            if _tips(curA, b):
+                aTips[curA].add(b)
+        for a, t in aTips.items():
+            gains[a] = len(t)
 
     rejected = set()
     nSwaps = 0
@@ -2750,164 +2747,103 @@ def refineWithSwapsV2(polygons, placed, tau, candidates, viewCache,
         bestCross = False
         pairsEvaluated = pairsPruned = 0
 
-        if useParallel:
-            # ==== PARALLEL PASS SCAN ====
-            # Same three ingredients as the serial scan below -- the exact
-            # non-interacting formula, the gains+lossHit upper bound, and
-            # exact evaluation of whatever survives -- but the bound runs
-            # vectorized in numpy and the exact evaluations run across
-            # worker processes reading the mmap'd packed viewshed.
-            # ---- phase 0: best NON-interacting swap (cheap, exact) ----
-            rOrder = sorted(placedSet, key=lambda x: len(lossSet[x]))
-            for r in rOrder:
-                nLoss = len(lossSet[r])
-                for a in gainOrder:
-                    d = gains[a] - nLoss
-                    if d <= bestDelta:
-                        break
-                    if (r, a) in rejected or _seesAnyOf(a, committedViewSets[r]):
-                        continue
-                    bestDelta = d
-                    bestSwap = (r, a)
-                    bestCross = True
-                    break
-            floorDelta = bestDelta
-            # ---- phase 1: vectorized upper bound over each r's pool ----
-            gainsArr = np.fromiter((gains.get(c, 0) for c in _candList),
-                                   dtype=np.int64, count=len(_candList))
-            tasks, taskRs = [], []
-            for r in rOrder:
-                loss = lossSet[r]
-                nLoss = len(loss)
-                poolIdx = poolCache[r]
-                if len(poolIdx) == 0:
-                    continue
-                if loss:
-                    hitIdx = np.concatenate(
-                        [_bToCandFlat[_bToCandPtr[b]:_bToCandPtr[b + 1]]
-                         for b in loss])
-                    pos = np.searchsorted(poolIdx, hitIdx)
-                    valid = pos < len(poolIdx)
-                    match = np.zeros(len(hitIdx), dtype=bool)
-                    match[valid] = poolIdx[pos[valid]] == hitIdx[valid]
-                    counts = np.bincount(pos[match], minlength=len(poolIdx))
-                    ub = gainsArr[poolIdx] + counts - nLoss
-                else:
-                    ub = gainsArr[poolIdx] - nLoss
-                surv = poolIdx[ub > floorDelta]
-                pairsPruned += len(poolIdx) - len(surv)
-                if len(surv) == 0:
-                    continue
-                rView = committedViewSets[r]
-                bw = baseWithout[r]
-                pairs = []
-                neededBs = set()
-                for i in surv.tolist():
-                    a = _candList[i]
-                    if a not in remaining or (r, a) in rejected:
-                        continue
-                    tipBs = list(aTips[a] & rView)
-                    lossBs = [b for b in loss if _seesB(i, b)]
-                    if gains[a] + len(lossBs) - nLoss <= floorDelta:
-                        continue
-                    pairs.append((i, gains[a], tipBs, lossBs))
-                    neededBs.update(tipBs)
-                    neededBs.update(lossBs)
-                if not pairs:
-                    continue
-                tasks.append((tau, len(tasks), nLoss, floorDelta,
-                              {b: bw[b] for b in neededBs}, pairs))
-                taskRs.append(r)
-                pairsEvaluated += len(pairs)
-            # ---- phase 2: exact evaluation across worker processes ----
-            if tasks:
-                if pairsEvaluated >= 64:
-                    outcomes = list(pool.imap_unordered(
-                        _refineScanTask, tasks,
-                        chunksize=max(1, len(tasks) // (nProcs * 4))))
-                else:
-                    _RPW["p"] = _pk    # tiny batch: same code, in-process
-                    outcomes = [_refineScanTask(t) for t in tasks]
-                # deterministic pick: highest delta, then lowest-loss r
-                # (task order), then lowest candidate index
-                outcomes.sort(key=lambda t: (-t[1], t[0], t[2]))
-                tId, d, aIdx = outcomes[0]
-                if aIdx >= 0 and d > bestDelta:
-                    bestDelta = d
-                    bestSwap = (taskRs[tId], _candList[aIdx])
-                    bestCross = False
-
-        # ascending removal-loss order: cheap removals produce the biggest
-        # deltas, raising bestDelta early so the ub check prunes harder on
-        # every antenna scanned after  (serial scan; skipped when the
-        # parallel scan above already did this pass)
-        for r in ([] if useParallel else
-                  sorted(placedSet, key=lambda x: len(lossSet[x]))):
-            loss = lossSet[r]
-            nLoss = len(loss)
-            bw = baseWithout[r]
-
-            # -- interacting pairs: exact evaluation incl. loss recovery,
-            # over only the buildings that can move the delta
-            rView = committedViewSets[r]
-            for a in poolCache[r]:
-                if a not in remaining or (r, a) in rejected:
-                    continue
-                vs = viewSet[a]
-                tips = aTips[a]
-                lossHit = loss & vs
-                # Tight upper bound via tip sets. Removing r only LOWERS
-                # coverage on r's buildings, so a's newly-served set
-                # without r is a subset of its global tip set, and loss
-                # recovery is at most the losses a touches:
-                #     delta <= gains[a] + |lossHit| - nLoss
-                # At low tau this is drastically tighter than the old
-                # |unserved & vs| bound (most touches don't tip anything
-                # at tau=0.25), which is what collapsed pruning there.
-                ub = gains[a] + len(lossHit) - nLoss
-                if ub <= bestDelta:
-                    pairsPruned += 1
-                    continue
-                pairsEvaluated += 1
-                va = viewCache[a]
-                el = extraLen[a]
-                # Exact newly-served count: global tips carry over
-                # unchanged unless the building is in r's shadow -- only
-                # those need rechecking against the without-r baseline.
-                newly = gains[a]
-                for b in tips & rView:
-                    pb = perim[b]
-                    m, v = bw[b]
-                    if (v + el.get(b, 0.0)) / pb < tau or \
-                       _covWithExtra(m, v, va.get(b), pb) < tau:
-                        newly -= 1
-                delta = newly - nLoss
-                for b in lossHit:
-                    pb = perim[b]
-                    if pb < 1e-9:
-                        continue
-                    m, v = bw[b]
-                    if (v + el.get(b, 0.0)) / pb < tau:
-                        continue
-                    if _covWithExtra(m, v, va.get(b), pb) >= tau:
-                        delta += 1        # loss recovered by a
-                if delta > bestDelta:
-                    bestDelta = delta
-                    bestSwap = (r, a)
-                    bestCross = False
-
-            # -- non-interacting pairs: delta = gains[a] - nLoss exactly
+        # ==== PASS SCAN ====
+        # Three ingredients: the exact non-interacting formula, the
+        # gains+lossHit upper bound, and exact evaluation of whatever
+        # survives. The bound runs vectorized in the parent; the exact
+        # evaluations run across worker processes reading the mmap'd
+        # packed viewshed.
+        #
+        # Removal candidates are visited in ascending removal-loss order:
+        # cheap removals produce the biggest deltas, raising the floor
+        # early so the bound prunes harder on everything scanned after.
+        # ---- phase 0: best NON-interacting swap (cheap, exact) ----
+        rOrder = sorted(placedSet, key=lambda x: len(lossSet[x]))
+        for r in rOrder:
+            nLoss = len(lossSet[r])
             for a in gainOrder:
                 d = gains[a] - nLoss
                 if d <= bestDelta:
                     break
-                if (r, a) in rejected or \
-                   not viewSet[a].isdisjoint(committedViewSets[r]):
+                if (r, a) in rejected or _seesAnyOf(a, committedViewSets[r]):
                     continue
                 bestDelta = d
                 bestSwap = (r, a)
                 bestCross = True
                 break
+        floorDelta = bestDelta
+        # ---- phase 1: vectorized upper bound over each r's pool ----
+        # Stays in the parent rather than being farmed out: these are
+        # per-removal-candidate slices of a few thousand entries, and
+        # shipping each one to a worker would cost more in pickling than
+        # the arithmetic saves. Only the survivors -- which need the
+        # expensive exact interval math -- are worth dispatching.
+        gainsArr = np.fromiter((gains.get(c, 0) for c in _candList),
+                               dtype=np.int64, count=len(_candList))
+        tasks, taskRs = [], []
+        for r in rOrder:
+            loss = lossSet[r]
+            nLoss = len(loss)
+            poolIdx = poolCache[r]
+            if len(poolIdx) == 0:
+                continue
+            if loss:
+                hitIdx = np.concatenate(
+                    [_bToCandFlat[_bToCandPtr[b]:_bToCandPtr[b + 1]]
+                     for b in loss])
+                pos = np.searchsorted(poolIdx, hitIdx)
+                valid = pos < len(poolIdx)
+                match = np.zeros(len(hitIdx), dtype=bool)
+                match[valid] = poolIdx[pos[valid]] == hitIdx[valid]
+                counts = np.bincount(pos[match], minlength=len(poolIdx))
+                ub = gainsArr[poolIdx] + counts - nLoss
+            else:
+                ub = gainsArr[poolIdx] - nLoss
+            surv = poolIdx[ub > floorDelta]
+            pairsPruned += len(poolIdx) - len(surv)
+            if len(surv) == 0:
+                continue
+            rView = committedViewSets[r]
+            bw = baseWithout[r]
+            pairs = []
+            neededBs = set()
+            for i in surv.tolist():
+                a = _candList[i]
+                if a not in remaining or (r, a) in rejected:
+                    continue
+                tipBs = list(aTips[a] & rView)
+                lossBs = [b for b in loss if _seesB(i, b)]
+                if gains[a] + len(lossBs) - nLoss <= floorDelta:
+                    continue
+                pairs.append((i, gains[a], tipBs, lossBs))
+                neededBs.update(tipBs)
+                neededBs.update(lossBs)
+            if not pairs:
+                continue
+            tasks.append((tau, len(tasks), nLoss, floorDelta,
+                          {b: bw[b] for b in neededBs}, pairs))
+            taskRs.append(r)
+            pairsEvaluated += len(pairs)
+        # ---- phase 2: exact evaluation across worker processes ----
+        if tasks:
+            if pairsEvaluated >= 64:
+                outcomes = list(pool.imap_unordered(
+                    _refineScanTask, tasks,
+                    chunksize=max(1, len(tasks) // (nProcs * 4))))
+            else:
+                # Batch too small to be worth the dispatch: identical code,
+                # run in-process. Not a serial MODE -- there is no setting
+                # that reaches it, and it cannot change the result.
+                _RPW["p"] = _pk
+                outcomes = [_refineScanTask(t) for t in tasks]
+            # deterministic pick: highest delta, then lowest-loss r
+            # (task order), then lowest candidate index
+            outcomes.sort(key=lambda t: (-t[1], t[0], t[2]))
+            tId, d, aIdx = outcomes[0]
+            if aIdx >= 0 and d > bestDelta:
+                bestDelta = d
+                bestSwap = (taskRs[tId], _candList[aIdx])
+                bestCross = False
 
         if bestSwap is None:
             break
@@ -3032,9 +2968,8 @@ def refineWithSwapsV2(polygons, placed, tau, candidates, viewCache,
                   f"{bonus} -> {len(servedNow)} "
                   f"[{time.perf_counter()-itT0:.2f}s]")
 
-    if pool is not None:
-        pool.close()
-        pool.join()
+    pool.close()
+    pool.join()
 
     if verbose:
         if hitCap:
