@@ -48,73 +48,6 @@ Relavant switches to change:
 
 ---
 
-## Processing units
-
-Everything runs on **CPU cores**, across multiprocessing worker processes.
-One switch decides how many. `compute.py` resolves it once and every stage
-asks it, so it governs the whole program rather than one stage at a time.
-`solve()` prints the resolved count before it does any work.
-
-| `CPU_PROCESSES` | meaning                                                        |
-| --------------- | -------------------------------------------------------------- |
-| `None`          | every core on the machine                                      |
-| integer         | that many, **capped** at how many cores exist and floored at 1 |
-
-The clamp matters in both directions: asking for more processes than cores
-buys nothing and costs context-switching plus a full interpreter's memory per
-extra worker, while zero or negative would mean "no parallelism", which this
-pipeline has no path for.
-
-**Everything that can be parallel is parallel.** The old ways to turn
-parallelism off — `buildAndCacheViewsheds(parallel=False)`,
-`REFINE_PROCESSES = 0`, and the serial swap scan they selected — are gone,
-along with the per-stage `REFINE_PROCESSES` / `VANTAGE_PROCESSES` counts,
-which are now just `CPU_PROCESSES`.
-
-### Why there is no GPU backend
-
-One was built and removed on 2026-08-01. Recording the measurement so it does
-not get re-proposed from scratch:
-
-The pipeline has two kinds of parallel work, and they are not equally
-portable to a GPU.
-
-- **Array-shaped work** — the packed-viewshed build (`_segmentedUnionLengths`
-  and the derived `cbExtra`/`cbCov` tables) and the swap scan's gain-init
-  prune. Flat numpy, no data-dependent control flow; these _do_ port to CuPy
-  essentially unchanged, and a working CuPy backend for them was implemented
-  and verified.
-- **Everything that costs real time** — the visibility sweeps (viewshed
-  precompute, validation re-sweep, vantage graph) and the swap scan's exact
-  interval evaluation. Pure-Python geometry over dicts of tuples, with a
-  dynamically-ordered active edge set and data-dependent branching. There is
-  no GPU kernel for these and writing one is a _rewrite of the algorithm_,
-  not a port.
-
-The second group is where the hours go: precompute alone is ~36 min
-single-core at r=160 (~77 min at two doublings), the vantage graph ~22 min,
-and refinement is time-budgeted at 3600 s × 9 subcases. The array stages
-finish in seconds. So the GPU backend was accelerating a rounding error in
-the total, at the cost of a second numerical path, a CuPy dependency, and a
-whole vocabulary of "array stage / geometry stage / per-stage fallback"
-in the annotations. It was deleted and the array stages returned to plain
-numpy.
-
-**If you ever revisit it**, the only piece worth doing is the viewshed
-precompute, and it needs the sweep reformulated rather than ported: replace
-the O(E log E) angular sweep and its dynamic active set with brute-force
-angular-interval clipping — for each target edge, clip its angular span
-against every occluder in the local scene. That is O(E²) per candidate but
-branch-light, fixed-size output, and one thread per candidate across ~78,727
-independent candidates. Radius restriction already keeps local scenes to
-hundreds of edges, so the extra asymptotic work is plausibly bought back many
-times over. The validation re-sweep falls out of the same kernel for free.
-Nothing else is worth the complexity, and the greedy/lookahead placement loop
-is irreducibly sequential regardless (step _n+1_ depends on step _n_ — that
-is the submodular argument the whole approach rests on).
-
----
-
 ## Problem
 
 | switch            | meaning                                   |
@@ -390,12 +323,12 @@ the real graph is saved.
 exactly the settings its _contents_ depend on, and nothing more — a knob
 that cannot change the result must never cost a rebuild:
 
-| cache                                    | keyed on                                              | deliberately **not** keyed on                       |
-| ---------------------------------------- | ----------------------------------------------------- | --------------------------------------------------- |
-| `viewcache_r{radius}[_d{doublings}].pkl` | dataset, `SOLVE_RADIUS`, corridor reach (`maxRadius`) | `SOLVE_GRIDCELL`, process/chunk counts              |
-| `viewcache_*_packed.*`                   | the viewshed cache it mirrors                         | as above                                            |
-| `vantage_graph_r{radius}.pkl`            | dataset, `VANTAGE_RADIUS`                             | `VANTAGE_NODE_CAPACITY`, grid cell, `CPU_PROCESSES` |
-| `vantage_seeds_r{radius}_n{n}.pkl`       | the above + seed count                                | as above                                            |
+| cache                                    | keyed on                                              | deliberately **not** keyed on                           |
+| ---------------------------------------- | ----------------------------------------------------- | ------------------------------------------------------- |
+| `viewcache_r{radius}[_d{doublings}].pkl` | dataset, `SOLVE_RADIUS`, corridor reach (`maxRadius`) | `SOLVE_GRIDCELL`, process/chunk counts                  |
+| `viewcache_*_packed.*`                   | the viewshed cache it mirrors                         | as above                                                |
+| `vantage_graph_r{radius}.pkl`            | dataset, `VANTAGE_RADIUS`                             | `VANTAGE_NODE_CAPACITY`, grid cell, `VANTAGE_PROCESSES` |
+| `vantage_seeds_r{radius}_n{n}.pkl`       | the above + seed count                                | as above                                                |
 
 The excluded ones are pure performance knobs. `VANTAGE_NODE_CAPACITY` is
 the STRtree's leaf capacity: it changes the tree's shape, not which boxes
@@ -439,15 +372,13 @@ What is spread across worker processes, what is merely vectorized in the
 parent, and what deliberately is neither. Worker counts all come from
 `CPU_PROCESSES`.
 
-| stage                            | how                                                            |
-| -------------------------------- | -------------------------------------------------------------- |
-| viewshed precompute              | worker processes — `precomputeViewshedsParallel`, the big one  |
-| validation coverage re-sweep     | worker processes — `localEvalCoverParallel`, one sweep/antenna |
-| visibility graph (vantage seeds) | worker processes — `buildVisibilityGraphRadiusBVH`             |
-| refine swap scan (exact eval)    | worker processes on the mmap'd packed arrays                   |
-| packed-viewshed build            | vectorized in the parent — seconds, not worth splitting        |
-| refine swap scan (gain init)     | vectorized in the parent — one pass, then exact checks         |
-| greedy / lookahead placement     | neither — inherently sequential (see below)                    |
+| stage                            | parallel?                                         |
+| -------------------------------- | ------------------------------------------------- |
+| viewshed precompute              | yes — `precomputeViewshedsParallel`, the big one  |
+| validation coverage re-sweep     | yes — `localEvalCoverParallel`, one sweep/antenna |
+| visibility graph (vantage seeds) | yes — `buildVisibilityGraphRadiusBVH`             |
+| **refine swap scan**             | **yes — new, see `REFINE_PROCESSES`**             |
+| greedy / lookahead placement     | no — inherently sequential (see below)            |
 
 **Why placement is not parallelized.** Greedy and the lookahead are
 strictly sequential by construction: step _n+1_'s gains depend on what step
