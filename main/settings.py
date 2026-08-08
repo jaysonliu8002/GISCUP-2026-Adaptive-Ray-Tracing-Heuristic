@@ -38,6 +38,10 @@ CPU_PROCESSES = None
 TAUS = [0.25, 0.5, 0.75]
 KS   = [50, 500, 1000]
 GEOJSON_PATH = os.path.join(REPO_ROOT, "dataset1_sample.geojson")
+# Cache filenames encode the settings, NOT the dataset, so changing this
+# aborts on the cache built from the previous one instead of overwriting it.
+# The error names the files to delete; or give each dataset its own
+# CACHE_DIR to keep both. See README ("Switching datasets").
 
 # -- radii / viewshed reach --------------------------------------------------
 SOLVE_RADIUS       = 80.0

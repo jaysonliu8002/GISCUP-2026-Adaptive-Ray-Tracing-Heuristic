@@ -25,6 +25,7 @@ from lib_giscup import (
     normalizePolygon, pointOnEdge, computeConvexity, SpatialGrid,
     loadOrBuildPackedViewshed, extraLenFromPacked, baseCovFromPacked,
     buildBuildingToCandidates, buildRefineParallelContext,
+    StaleCacheError,
 )
 # matplotlib is imported INSIDE the plotting functions, never at module
 # scope: multiprocessing spawn re-imports this file in every worker, so a
@@ -33,6 +34,7 @@ from lib_giscup import (
 from centrality_giscup import loadOrPickVantageSeeds
 from datetime import datetime
 import os
+import sys
 import time
 
 # ---------------------------------------------------------------------------
@@ -286,7 +288,8 @@ def _pickVantageSeeds(polygons, convexity, n=0, radius=VANTAGE_RADIUS,
         polygons, candidates, n=n, radius=radius, nodeCapacity=nodeCapacity,
         convexity=convexity, verbose=verbose,
         seedsPath=os.path.join(CACHE_DIR, f"vantage_seeds_{tag}_n{n}.pkl"),
-        graphPath=os.path.join(CACHE_DIR, f"vantage_graph_{tag}.pkl"))
+        graphPath=os.path.join(CACHE_DIR, f"vantage_graph_{tag}.pkl"),
+        geojsonPath=GEOJSON_PATH)
     if verbose:
         print(f"Vantage seeds ({len(top)}/{n} requested):")
         for v, deg in top:
@@ -398,13 +401,15 @@ def solve(seed=0):
     candidates, viewCache, perim = _timed(
         "loadOrBuildViewsheds", loadOrBuildViewsheds,
         polygons, radius=SOLVE_RADIUS, gridCell=SOLVE_GRIDCELL,
-        maxRadius=_adaptiveMax(), path=cacheBase + ".pkl")
+        maxRadius=_adaptiveMax(), path=cacheBase + ".pkl",
+        geojsonPath=GEOJSON_PATH)
 
     # Packed numpy mirror of the cache (built once, then loaded mmap'd):
     # feeds the parallel refine workers AND yields the shared per-
     # (candidate, building) tables below as vectorized array reads.
     packed = _timed("loadOrBuildPackedViewshed", loadOrBuildPackedViewshed,
-                    cacheBase + "_packed", candidates, viewCache, perim, polygons)
+                    cacheBase + "_packed", candidates, viewCache, perim, polygons,
+                    geojsonPath=GEOJSON_PATH)
     _EXTRA_LEN["v"] = _timed("extraLenFromPacked (shared by greedy/lookahead/refine)",
                              extraLenFromPacked, candidates, packed)
     _SHARED["baseCov"] = _timed("baseCovFromPacked (shared standalone coverages)",
@@ -813,7 +818,16 @@ if __name__ == "__main__":
 
     print(f"Start: {datetime.now()}")
 
-    solve()
+    try:
+        solve()
+    except StaleCacheError as e:
+        # cache/ holds another dataset's work. Reported as a plain message
+        # rather than a traceback: the stack is noise here, the two dataset
+        # names and the rm line are the whole content. Nothing was written.
+        sys.stdout.flush()      # so the abort lands after the progress log,
+                                # not ahead of it, when output is redirected
+        print(f"\nERROR: {e}", file=sys.stderr)
+        raise SystemExit(1)
     print(f"Solved: {datetime.now()}")
 
     print(f"[__main__ total] took {time.perf_counter() - mainStart:.2f}s")

@@ -328,9 +328,10 @@ all, since the whole precompute is only ~6 min wall on 12 cores, and holds
 more finished work in RAM waiting to flush.) A restart loads it and re-sweeps only the candidates
 it does not already have. A frame torn by a crash mid-append is detected and
 skipped on load, so the file is always usable; the header frame records
-dataset fingerprint + radius + corridor reach, and a mismatch discards the
-checkpoint rather than resuming with wrong viewsheds. The `.partial` is
-deleted once the real cache is saved. The full cache itself is still written
+dataset fingerprint + radius + corridor reach. A settings mismatch discards
+the checkpoint rather than resuming with wrong viewsheds; a **dataset**
+mismatch aborts the run instead (see "Switching datasets" below). The
+`.partial` is deleted once the real cache is saved. The full cache itself is still written
 **before any solving starts** (unchanged, and it already used
 write-temp-then-`os.replace`), so the expensive stage is banked first.
 
@@ -373,6 +374,41 @@ symmetrically, so the result is order-independent. Previously
 `VANTAGE_NODE_CAPACITY` _was_ in both the graph's filename and its
 metadata, which meant retuning a BVH constant threw away a 22-minute
 build for no reason.
+
+**Switching datasets.** Note what the filenames above do _not_ contain: the
+dataset. Two `.geojson` files solved at the same settings collide on one set
+of names, so every cache file additionally stamps the dataset it was built
+from — `fingerprint` (a hash of the geometry, which is what decides reuse)
+plus `geojsonName` (carried along only so an error can name a file instead
+of a hex digest, and excluded from the comparison, so renaming or moving a
+`.geojson` does not invalidate a cache whose geometry still matches).
+
+Changing `GEOJSON_PATH` therefore **aborts before any work happens** rather
+than rebuilding:
+
+```
+ERROR: cache/viewcache_r80_d5.pkl was built from a different dataset.
+    cached : GIS-cup-sample-dataset.geojson  (4249e7da)
+    current: dataset1_sample.geojson         (06b9fb44)
+
+  Delete the stale cache to build for this dataset:
+    rm cache/viewcache_r80_d5*
+
+  (aborting; nothing was modified)
+```
+
+Aborting, rather than rebuilding over the file, is the point: the cache that
+is in the way cost hours to produce and is still the valid one for the
+_other_ dataset, so throwing it away has to be a deliberate act. The `rm`
+line names the whole family (`.pkl`, its `.partial`, and the `_packed.*`
+mirror) because deleting only one of them leaves `cache/` half-stale. To
+keep both datasets cached, give each its own `CACHE_DIR` instead of deleting
+anything. A **settings** mismatch is unaffected and still rebuilds silently
+— those are already encoded in the filename, so nothing collides.
+
+> Because the fingerprint is what decides, this is not a cache-format break:
+> caches built before the stamp existed carry no `geojsonName` and are still
+> reused as-is for the dataset they match.
 
 > **shapely is required for vantage seeding and is not currently installed.**
 > With `VANTAGE_SEED_PERCENT > 0` (it defaults to `0.01`) a run needs it.

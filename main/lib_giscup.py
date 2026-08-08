@@ -1629,6 +1629,123 @@ def _viewshedTask(antenna):
          for localPi, edgeMap in profile.items()})
     return antenna, view
 
+# ===========================================================================
+#  DATASET IDENTITY  (which .geojson a cache file was built from)
+#
+#  Cache files under cache/ are named for the SETTINGS their contents
+#  depend on -- radius, doublings, vantage radius -- but NOT for the
+#  dataset, so two datasets solved at the same settings collide on one
+#  filename. Every cache file therefore carries a stamp of the dataset it
+#  was built from, and a mismatch is a hard STOP rather than a silent
+#  rebuild: rebuilding overwrites a cache that cost hours to produce and
+#  that the other dataset still needs, so the choice to throw it away has
+#  to be the operator's, not ours. Nothing here ever deletes a file.
+#
+#  `fingerprint` is what decides match/mismatch. `geojsonName` rides along
+#  purely so the error can name a file instead of a hex digest, and is
+#  EXCLUDED from the comparison -- renaming or moving a .geojson whose
+#  geometry is unchanged must not invalidate an otherwise valid cache.
+# ===========================================================================
+
+class StaleCacheError(RuntimeError):
+    """A cache file on disk was built from a different dataset."""
+
+
+# Recorded in every cache's metadata, but never compared -- see above.
+_COSMETIC_META = ("geojsonName",)
+
+
+def _datasetFingerprint(polygons):
+    """Cheap, order-sensitive fingerprint of the polygon geometry."""
+    h = hashlib.sha256()
+    h.update(repr(len(polygons)).encode())
+    # sample first/last few polygons' coords + total vertex count for a fast hash
+    h.update(repr(sum(len(p) for p in polygons)).encode())
+    for p in polygons[:50] + polygons[-50:]:
+        h.update(repr(p).encode())
+    return h.hexdigest()
+
+
+def datasetMeta(polygons, geojsonPath=None, **extra):
+    """The identity block stamped into a cache file: the dataset it was
+    built from, plus whatever settings `extra` names."""
+    meta = {"fingerprint": _datasetFingerprint(polygons)}
+    if geojsonPath:
+        meta["geojsonName"] = os.path.basename(geojsonPath)
+    meta.update(extra)
+    return meta
+
+
+def _comparable(meta):
+    return {k: v for k, v in (meta or {}).items() if k not in _COSMETIC_META}
+
+
+def metaMatches(onDisk, want):
+    """True when two identity blocks describe interchangeable contents."""
+    return _comparable(onDisk) == _comparable(want)
+
+
+def datasetDiffers(onDisk, want):
+    """True when two metas disagree about the DATASET specifically, as
+    opposed to a setting like radius or seed count. Only this warrants a
+    hard stop -- a settings difference is an ordinary rebuild."""
+    return (onDisk or {}).get("fingerprint") != (want or {}).get("fingerprint")
+
+
+def _shortPath(path):
+    """`path` relative to the repo root, with forward slashes, for messages
+    a user is meant to paste into a shell."""
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    try:
+        rel = os.path.relpath(os.path.abspath(path), root)
+    except ValueError:            # different drive on Windows
+        rel = os.path.abspath(path)
+    return rel.replace(os.sep, "/")
+
+
+def _describeDataset(meta):
+    """(name, shortFingerprint) for a meta block, tolerating older cache
+    files that predate the geojsonName stamp."""
+    meta = meta or {}
+    return (meta.get("geojsonName") or "<unrecorded dataset>",
+            (meta.get("fingerprint") or "?")[:8])
+
+
+def _viewshedDeleteGlob(path):
+    """The glob covering every file that shares a viewshed cache's fate:
+    the .pkl, its .partial checkpoint, and the _packed.* mirror. Deleting
+    only one of them leaves cache/ half-stale, so the message names all
+    three at once. Accepts any of them and walks back to the common stem."""
+    if path is None:
+        return None
+    base = path
+    for suffix in (".partial", ".meta.json", ".pkl", "_packed"):
+        if base.endswith(suffix):
+            base = base[:-len(suffix)]
+    return _shortPath(base) + "*"
+
+
+def raiseStaleCache(path, onDisk, want, deleteGlob=None):
+    """Abort with a message naming both datasets and the files to delete.
+
+    `deleteGlob` should cover every file the named one is useless without
+    (a viewshed .pkl is worth nothing once its packed mirror is gone), so
+    that following the instruction leaves cache/ in a consistent state.
+    """
+    cachedName, cachedFp = _describeDataset(onDisk)
+    currentName, currentFp = _describeDataset(want)
+    width = max(len(cachedName), len(currentName))
+    raise StaleCacheError(
+        f"{_shortPath(path)} was built from a different dataset.\n"
+        f"    cached : {cachedName:<{width}}  ({cachedFp})\n"
+        f"    current: {currentName:<{width}}  ({currentFp})\n"
+        f"\n"
+        f"  Delete the stale cache to build for this dataset:\n"
+        f"    rm {deleteGlob or _shortPath(path)}\n"
+        f"\n"
+        f"  (aborting; nothing was modified)")
+
+
 # ---------------------------------------------------------------------------
 #  CRASH CHECKPOINTS  (shared by the viewshed precompute and the
 #  centrality visibility-graph build -- both are long parallel loops over
@@ -1654,15 +1771,28 @@ class _CheckpointWriter:
     holds more finished work in RAM waiting to be written.
     """
 
-    def __init__(self, path, meta, every=120.0):
+    def __init__(self, path, meta, every=120.0, deleteGlob=None):
         self.path = path
         self.every = every
         self.pending = []
         self._last = time.monotonic()
         os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
-        isNew = not os.path.exists(path)
-        self.fh = open(path, "ab")
-        if isNew:
+
+        # The header frame is written ONCE, at creation, so it describes the
+        # whole file forever after. Appending to a checkpoint whose header
+        # says something else therefore files the new frames under the wrong
+        # identity -- silently mixing two datasets' results in one file that
+        # a later run would happily resume from. Decide which file we are
+        # actually opening before opening it.
+        onDisk = _checkpointHeader(path) if os.path.exists(path) else None
+        if onDisk is not None and datasetDiffers(onDisk, meta or {}):
+            raiseStaleCache(path, onDisk, meta or {}, deleteGlob=deleteGlob)
+        # Same dataset but different settings, or a header too torn to read:
+        # the finished work in it does not apply, and it cannot be appended
+        # to, so start the file over rather than growing a mixed one.
+        fresh = onDisk is None or not metaMatches(onDisk, meta or {})
+        self.fh = open(path, "wb" if fresh else "ab")
+        if fresh:
             pickle.dump({"__checkpoint_meta__": meta or {}}, self.fh,
                         protocol=pickle.HIGHEST_PROTOCOL)
             self.fh.flush()
@@ -1697,29 +1827,50 @@ class _CheckpointWriter:
             self.fh.close()
 
 
-def _loadCheckpointPairs(path, meta, verbose=True):
+def _checkpointHeader(path):
+    """The meta header frame of a checkpoint file, or None when it has no
+    readable one (missing, empty, or torn before the first flush)."""
+    try:
+        with open(path, "rb") as f:
+            header = pickle.load(f)
+    except Exception:
+        return None
+    if isinstance(header, dict) and "__checkpoint_meta__" in header:
+        return header["__checkpoint_meta__"]
+    return None
+
+
+def _loadCheckpointPairs(path, meta, verbose=True, deleteGlob=None):
     """
     Load the (key, value) pairs from a _CheckpointWriter file as a dict
     (empty when there is nothing usable).
 
     Reading stops cleanly at end-of-file OR at a frame that fails to
     unpickle -- the latter is the signature of a crash midway through an
-    append, and everything written before it is still valid. A metadata
-    mismatch (different dataset, radius, or settings) discards the whole
-    file rather than resuming from work that no longer applies.
+    append, and everything written before it is still valid.
+
+    A DIFFERENT DATASET raises StaleCacheError: resuming from it would
+    graft one dataset's viewsheds onto another's candidates, and silently
+    starting over would instead overwrite a checkpoint the other dataset
+    may still want. A settings-only mismatch is the ordinary case -- the
+    work simply does not apply, so it is ignored and rebuilt.
     """
     if not os.path.exists(path):
+        return {}
+    header = _checkpointHeader(path)
+    if header is None:
+        return {}                 # nothing readable to resume from
+    if datasetDiffers(header, meta or {}):
+        raiseStaleCache(path, header, meta or {}, deleteGlob=deleteGlob)
+    if not metaMatches(header, meta or {}):
+        if verbose:
+            print(f"  checkpoint {path} is from a different "
+                  f"config; ignoring it")
         return {}
     out = {}
     try:
         with open(path, "rb") as f:
-            header = pickle.load(f)
-            if not (isinstance(header, dict)
-                    and header.get("__checkpoint_meta__") == meta):
-                if verbose:
-                    print(f"  checkpoint {path} is from a different "
-                          f"dataset/config; ignoring it")
-                return {}
+            pickle.load(f)                    # skip the header frame
             while True:
                 for key, value in pickle.load(f):
                     out[key] = value
@@ -1734,7 +1885,7 @@ def precomputeViewshedsParallel(polygons, candidates, radius=80.0, gridCell=80.0
                                 chunksize=50, verbose=True,
                                 maxRadius=None, checkpointPath=None,
                                 checkpointMeta=None, checkpointEvery=120.0,
-                                precomputed=None):
+                                precomputed=None, deleteGlob=None):
     """
     Compute every candidate's viewshed across the configured processing
     units (see compute.py; this is a geometry stage, so CPU worker
@@ -1763,7 +1914,8 @@ def precomputeViewshedsParallel(polygons, candidates, radius=80.0, gridCell=80.0
     if not todo:
         return viewCache
 
-    ck = (_CheckpointWriter(checkpointPath, checkpointMeta, checkpointEvery)
+    ck = (_CheckpointWriter(checkpointPath, checkpointMeta, checkpointEvery,
+                            deleteGlob=deleteGlob)
           if checkpointPath is not None else None)
     try:
         with compute.workerPool(initializer=_initWorker,
@@ -1887,19 +2039,8 @@ def candidateList(polygons):
     return candidates
 
 
-def _datasetFingerprint(polygons):
-    """Cheap, order-sensitive fingerprint of the polygon geometry."""
-    h = hashlib.sha256()
-    h.update(repr(len(polygons)).encode())
-    # sample first/last few polygons' coords + total vertex count for a fast hash
-    h.update(repr(sum(len(p) for p in polygons)).encode())
-    for p in polygons[:50] + polygons[-50:]:
-        h.update(repr(p).encode())
-    return h.hexdigest()
-
-
 def buildAndCacheViewsheds(polygons, radius=80.0, gridCell=80.0, path=None,
-                           verbose=True, maxRadius=None):
+                           verbose=True, maxRadius=None, geojsonPath=None):
     """
     Build the viewshed cache (candidates + perimeters + viewsheds) and, if a
     path is given, save it to disk. Returns (candidates, viewCache, perim).
@@ -1916,11 +2057,12 @@ def buildAndCacheViewsheds(polygons, radius=80.0, gridCell=80.0, path=None,
     # a restart after a crash resumes from it instead of re-sweeping from
     # scratch. Deleted once the real cache is fully saved.
     partialPath = (path + ".partial") if path is not None else None
-    checkpointMeta = {"fingerprint": _datasetFingerprint(polygons),
-                      "radius": radius, "maxRadius": maxRadius,
-                      "normalized": True}
+    checkpointMeta = datasetMeta(polygons, geojsonPath,
+                                 radius=radius, maxRadius=maxRadius,
+                                 normalized=True)
+    glob = _viewshedDeleteGlob(path)
     precomputed = (_loadCheckpointPairs(partialPath, checkpointMeta,
-                                        verbose=verbose)
+                                        verbose=verbose, deleteGlob=glob)
                    if partialPath else {})
 
     viewCache = precomputeViewshedsParallel(polygons, candidates,
@@ -1928,11 +2070,12 @@ def buildAndCacheViewsheds(polygons, radius=80.0, gridCell=80.0, path=None,
                                             verbose=verbose, maxRadius=maxRadius,
                                             checkpointPath=partialPath,
                                             checkpointMeta=checkpointMeta,
-                                            precomputed=precomputed)
+                                            precomputed=precomputed,
+                                            deleteGlob=glob)
 
     if path is not None:
         saveViewCache(path, polygons, radius, candidates, viewCache, perim,
-                      maxRadius=maxRadius)
+                      maxRadius=maxRadius, geojsonPath=geojsonPath)
         if verbose:
             print(f"Saved cache to {path}")
         if partialPath and os.path.exists(partialPath):
@@ -1945,7 +2088,7 @@ def buildAndCacheViewsheds(polygons, radius=80.0, gridCell=80.0, path=None,
 
 
 def saveViewCache(path, polygons, radius, candidates, viewCache, perim,
-                  maxRadius=None):
+                  maxRadius=None, geojsonPath=None):
     """Write the cache plus validation metadata to disk.
     Uses a write-to-temp-then-rename pattern so a crash or OOM during the
     write never leaves a truncated file behind -- the old cache stays intact
@@ -1956,7 +2099,9 @@ def saveViewCache(path, polygons, radius, candidates, viewCache, perim,
         "radius": radius,
         "maxRadius": maxRadius,       # adaptive corridor reach (None = plain)
         "nCandidates": len(candidates),
-        "fingerprint": _datasetFingerprint(polygons),
+        # dataset stamp: `fingerprint` decides reuse, `geojsonName` only
+        # makes a mismatch legible (see the DATASET IDENTITY section)
+        **datasetMeta(polygons, geojsonPath),
         # every interval list sorted + unioned (see normalizeView); a cache
         # without this flag is upgraded in place on load
         "normalized": True,
@@ -1981,13 +2126,18 @@ def saveViewCache(path, polygons, radius, candidates, viewCache, perim,
         raise
 
 
-def loadViewCache(path, polygons, radius, maxRadius=None):
+def loadViewCache(path, polygons, radius, maxRadius=None, geojsonPath=None):
     """
     Load a cache from disk, verifying it matches the current dataset, radius,
     AND adaptive corridor reach (maxRadius) -- a cache built with different
     ADAPTIVE_DOUBLINGS settings holds genuinely different viewsheds, so it is
     refused rather than silently loaded (previously only the filename encoded
-    this). Raises ValueError on mismatch.
+    this).
+
+    Raises ValueError on a SETTINGS mismatch, which the caller treats as an
+    ordinary rebuild, and StaleCacheError on a DATASET mismatch, which it
+    does not: the filename encodes the settings but not the dataset, so
+    rebuilding here would overwrite another dataset's hours-old cache.
 
     Returns (candidates, viewCache, perim, normalized), where `normalized`
     reports whether the intervals are already sorted+unioned. A False here
@@ -2008,6 +2158,11 @@ def loadViewCache(path, polygons, radius, maxRadius=None):
         if gcWasEnabled:
             gc.enable()
 
+    # Dataset first: it is the only mismatch the caller must NOT resolve by
+    # rebuilding over this file, so it wins even when a setting differs too.
+    want = datasetMeta(polygons, geojsonPath)
+    if datasetDiffers(blob, want):
+        raiseStaleCache(path, blob, want, deleteGlob=_viewshedDeleteGlob(path))
     if abs(blob["radius"] - radius) > 1e-9:
         raise ValueError(f"Cache radius {blob['radius']} != requested {radius}. "
                          "Rebuild the cache.")
@@ -2019,24 +2174,26 @@ def loadViewCache(path, polygons, radius, maxRadius=None):
        (cachedMax is not None and abs(cachedMax - maxRadius) > 1e-9):
         raise ValueError(f"Cache maxRadius {cachedMax} != requested {maxRadius}. "
                          "Rebuild the cache.")
-    if blob["fingerprint"] != _datasetFingerprint(polygons):
-        raise ValueError("Cache was built from a different dataset "
-                         "(fingerprint mismatch). Rebuild the cache.")
     return (blob["candidates"], blob["viewCache"], blob["perim"],
             bool(blob.get("normalized")))
 
 
 def loadOrBuildViewsheds(polygons, radius=80.0, gridCell=80.0, path="viewcache.pkl",
-                         verbose=True, maxRadius=None):
+                         verbose=True, maxRadius=None, geojsonPath=None):
     """
     Convenience: load the cache from `path` if it exists and matches; otherwise
     build it and save it. Returns (candidates, viewCache, perim).
+
+    A cache from a different DATASET is not "doesn't match" in this sense --
+    loadViewCache raises StaleCacheError for that and it propagates, because
+    rebuilding would overwrite the other dataset's cache in place.
     """
     import os
     if os.path.exists(path):
         try:
             candidates, viewCache, perim, normalized = loadViewCache(
-                path, polygons, radius, maxRadius=maxRadius)
+                path, polygons, radius, maxRadius=maxRadius,
+                geojsonPath=geojsonPath)
             if verbose:
                 print(f"Loaded cache from {path} "
                       f"({len(candidates)} candidates, radius {radius})")
@@ -2053,7 +2210,8 @@ def loadOrBuildViewsheds(polygons, radius=80.0, gridCell=80.0, path="viewcache.p
                 normalizeViewCache(viewCache, verbose=verbose)
                 try:
                     saveViewCache(path, polygons, radius, candidates,
-                                  viewCache, perim, maxRadius=maxRadius)
+                                  viewCache, perim, maxRadius=maxRadius,
+                                  geojsonPath=geojsonPath)
                     if verbose:
                         print(f"  re-saved normalized cache to {path}")
                 except OSError as e:
@@ -2065,7 +2223,8 @@ def loadOrBuildViewsheds(polygons, radius=80.0, gridCell=80.0, path="viewcache.p
             if verbose:
                 print(f"Cache at {path} unusable ({e}); rebuilding.")
     return buildAndCacheViewsheds(polygons, radius, gridCell, path,
-                                  verbose=verbose, maxRadius=maxRadius)
+                                  verbose=verbose, maxRadius=maxRadius,
+                                  geojsonPath=geojsonPath)
 
 # ===========================================================================
 #  PACKED VIEWSHED  (compact numpy mirror of the viewCache)
@@ -2241,33 +2400,42 @@ def loadPackedViewshed(prefix, mmapMode="r"):
 
 
 def loadOrBuildPackedViewshed(prefix, candidates, viewCache, perim, polygons,
-                              verbose=True):
+                              verbose=True, geojsonPath=None):
     """Load the packed mirror if present and matching this dataset/cache;
     otherwise build it from viewCache, save it, and reload memory-mapped
-    (dropping the in-heap build copies)."""
+    (dropping the in-heap build copies).
+
+    A mirror from a different DATASET raises StaleCacheError instead: these
+    .npy files are named for the settings only, so rebuilding would replace
+    another dataset's mirror on disk."""
     # "normalized" pins the packed arrays to normalized intervals: cbExtra
     # is the UNION length there (a tighter, still-sound upper bound) rather
     # than the raw fragment sum, so a packed file built before normalization
     # must be rebuilt rather than reused.
-    meta = {"nCandidates": len(candidates),
-            "nBuildings": len(polygons),
-            "normalized": True,
-            "fingerprint": _datasetFingerprint(polygons)}
+    meta = datasetMeta(polygons, geojsonPath,
+                       nCandidates=len(candidates),
+                       nBuildings=len(polygons),
+                       normalized=True)
     metaPath = prefix + ".meta.json"
     if os.path.exists(metaPath):
         try:
             with open(metaPath) as f:
                 onDisk = json.load(f)
-            if onDisk == meta:
+        except Exception as e:
+            onDisk = None
+            if verbose:
+                print(f"  packed viewshed unusable ({e}); rebuilding")
+        if onDisk is not None:
+            if datasetDiffers(onDisk, meta):
+                raiseStaleCache(metaPath, onDisk, meta,
+                                deleteGlob=_viewshedDeleteGlob(prefix))
+            if metaMatches(onDisk, meta):
                 packed = loadPackedViewshed(prefix, mmapMode="r")
                 if verbose:
                     print(f"  packed viewshed loaded (mmap) from {prefix}.*.npy")
                 return packed
             if verbose:
                 print("  packed viewshed on disk is stale; rebuilding")
-        except Exception as e:
-            if verbose:
-                print(f"  packed viewshed unusable ({e}); rebuilding")
     packed = buildPackedViewshed(candidates, viewCache, perim, len(polygons),
                                  verbose=verbose)
     savePackedViewshed(prefix, packed, meta)

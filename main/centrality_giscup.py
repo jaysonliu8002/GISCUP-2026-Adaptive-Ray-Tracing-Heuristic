@@ -50,7 +50,8 @@ from collections import defaultdict
 import compute
 from lib_giscup import (EPS, pointInsidePolygon, buildScene,
                         _CheckpointWriter, _loadCheckpointPairs,
-                        _datasetFingerprint)
+                        datasetMeta, datasetDiffers, metaMatches,
+                        raiseStaleCache, _shortPath)
 
 
 # ---------------------------------------------------------------------------
@@ -246,7 +247,7 @@ def buildVisibilityGraphRadiusBVH(polygons, candidates, radius, gridCell=None,
                                   node_capacity=10, chunksize=20,
                                   progressEvery=None, verbose=True,
                                   checkpointPath=None, checkpointMeta=None,
-                                  checkpointEvery=120.0):
+                                  checkpointEvery=120.0, deleteGlob=None):
     """
     Radius-restricted, UNCAPPED visibility graph using the same BVH+slab+
     early-exit+multiprocessing machinery as buildVisibilityGraphUnrestrictedBVH,
@@ -315,7 +316,8 @@ def buildVisibilityGraphRadiusBVH(polygons, candidates, radius, gridCell=None,
     # test only the vertices still missing. Edges are re-applied
     # symmetrically here exactly as they are below, so a resumed graph is
     # indistinguishable from one built in a single run.
-    restored = (_loadCheckpointPairs(checkpointPath, checkpointMeta, verbose=verbose)
+    restored = (_loadCheckpointPairs(checkpointPath, checkpointMeta,
+                                     verbose=verbose, deleteGlob=deleteGlob)
                 if checkpointPath else {})
     todo = list(range(V))
     if restored:
@@ -353,7 +355,8 @@ def buildVisibilityGraphRadiusBVH(polygons, candidates, radius, gridCell=None,
             "plain greedy."
         ) from e
 
-    ck = (_CheckpointWriter(checkpointPath, checkpointMeta, checkpointEvery)
+    ck = (_CheckpointWriter(checkpointPath, checkpointMeta, checkpointEvery,
+                            deleteGlob=deleteGlob)
           if checkpointPath else None)
     poolStartTime = time.perf_counter()
     processingStartTime = None
@@ -455,29 +458,36 @@ def _atomicPickle(path, blob):
         raise
 
 
-def _loadIfMeta(path, meta, what, verbose=True):
+def _loadIfMeta(path, meta, what, verbose=True, deleteGlob=None):
     """Load a pickled {'meta':..., 'data':...} blob, returning data only if
-    the metadata matches exactly. Any mismatch or read failure returns
-    None (rebuild) rather than raising -- a stale cache is a normal
-    condition, not an error."""
+    the metadata matches. A SETTINGS mismatch (a different seed count, say)
+    or a read failure returns None to rebuild -- that is a normal condition,
+    not an error.
+
+    A DATASET mismatch raises StaleCacheError instead: these files are named
+    for the vantage radius alone, so rebuilding would overwrite the cache
+    another dataset spent ~22 minutes producing."""
     if not path or not os.path.exists(path):
         return None
     try:
         with open(path, "rb") as f:
             blob = pickle.load(f)
-        if blob.get("meta") != meta:
-            if verbose:
-                print(f"  cached {what} at {path} is stale "
-                      f"(different dataset/settings); rebuilding")
-            return None
-        return blob["data"]
+        onDisk, data = blob["meta"], blob["data"]
     except Exception as e:
         if verbose:
             print(f"  cached {what} at {path} unusable ({e}); rebuilding")
         return None
+    if datasetDiffers(onDisk, meta):
+        raiseStaleCache(path, onDisk, meta, deleteGlob=deleteGlob)
+    if not metaMatches(onDisk, meta):
+        if verbose:
+            print(f"  cached {what} at {path} is stale "
+                  f"(different settings); rebuilding")
+        return None
+    return data
 
 
-def vantageMeta(polygons, candidates, radius):
+def vantageMeta(polygons, candidates, radius, geojsonPath=None):
     """
     Identity of a visibility graph: everything its CONTENTS depend on, and
     nothing else. Two graphs with equal meta are equal graphs.
@@ -497,14 +507,28 @@ def vantageMeta(polygons, candidates, radius):
                      Edges are applied symmetrically and order-
                      independently, so the result is the same either way.
     """
-    return {"fingerprint": _datasetFingerprint(polygons),
-            "nCandidates": len(candidates),
-            "radius": float(radius)}
+    return datasetMeta(polygons, geojsonPath,
+                       nCandidates=len(candidates),
+                       radius=float(radius))
+
+
+def _vantageDeleteGlob(radius, *paths):
+    """The glob covering BOTH vantage caches at this radius (graph and
+    seeds, plus their .partial checkpoints). The seeds are derived from the
+    graph, so a stale graph means a stale pair -- deleting only one would
+    leave the run to rebuild against the other."""
+    for p in paths:
+        if p:
+            dirName = os.path.dirname(os.path.abspath(p))
+            stem = os.path.join(dirName, f"vantage_*_r{int(radius)}")
+            return _shortPath(stem) + "*"
+    return None
 
 
 def loadOrBuildVantageGraph(polygons, candidates, radius, gridCell=None,
                             nodeCapacity=10, verbose=True,
-                            graphPath=None, checkpointEvery=120.0):
+                            graphPath=None, checkpointEvery=120.0,
+                            geojsonPath=None, deleteGlob=None):
     """
     The visibility graph for these candidates, from disk if a matching one
     is cached there, otherwise built (resuming from a partial build if one
@@ -514,8 +538,9 @@ def loadOrBuildVantageGraph(polygons, candidates, radius, gridCell=None,
                 alongside it as `<graphPath>.partial` and is deleted once
                 the full graph is saved. None disables both.
     """
-    meta = vantageMeta(polygons, candidates, radius)
-    cached = _loadIfMeta(graphPath, meta, "visibility graph", verbose=verbose)
+    meta = vantageMeta(polygons, candidates, radius, geojsonPath)
+    cached = _loadIfMeta(graphPath, meta, "visibility graph", verbose=verbose,
+                         deleteGlob=deleteGlob)
     if cached is not None:
         if verbose:
             nEdges = sum(len(n) for n in cached.values()) // 2
@@ -528,7 +553,7 @@ def loadOrBuildVantageGraph(polygons, candidates, radius, gridCell=None,
         polygons, candidates, radius=radius, gridCell=gridCell,
         node_capacity=nodeCapacity, verbose=verbose,
         checkpointPath=partialPath, checkpointMeta=meta,
-        checkpointEvery=checkpointEvery)
+        checkpointEvery=checkpointEvery, deleteGlob=deleteGlob)
 
     if graphPath:
         # store a plain dict: a defaultdict pickles its factory, and
@@ -547,7 +572,7 @@ def loadOrBuildVantageGraph(polygons, candidates, radius, gridCell=None,
 def loadOrPickVantageSeeds(polygons, candidates, n, radius, nodeCapacity=10,
                            convexity=None, verbose=True,
                            seedsPath=None, graphPath=None,
-                           checkpointEvery=120.0):
+                           checkpointEvery=120.0, geojsonPath=None):
     """
     The n vantage seeds for this dataset/radius, reusing as much prior work
     as exists: the cached seeds file if the whole request matches, else the
@@ -556,8 +581,11 @@ def loadOrPickVantageSeeds(polygons, candidates, n, radius, nodeCapacity=10,
     Returns [(vertex, degreeAtSelection), ...], the same shape
     topKVantageVertices returns.
     """
-    seedMeta = dict(vantageMeta(polygons, candidates, radius), n=int(n))
-    cached = _loadIfMeta(seedsPath, seedMeta, "vantage seeds", verbose=verbose)
+    seedMeta = dict(vantageMeta(polygons, candidates, radius, geojsonPath),
+                    n=int(n))
+    glob = _vantageDeleteGlob(radius, seedsPath, graphPath)
+    cached = _loadIfMeta(seedsPath, seedMeta, "vantage seeds", verbose=verbose,
+                         deleteGlob=glob)
     if cached is not None:
         if verbose:
             print(f"Loaded {len(cached)} vantage seeds from {seedsPath}")
@@ -566,7 +594,8 @@ def loadOrPickVantageSeeds(polygons, candidates, n, radius, nodeCapacity=10,
     adjacency = loadOrBuildVantageGraph(
         polygons, candidates, radius, nodeCapacity=nodeCapacity,
         verbose=verbose, graphPath=graphPath,
-        checkpointEvery=checkpointEvery)
+        checkpointEvery=checkpointEvery,
+        geojsonPath=geojsonPath, deleteGlob=glob)
     top = topKVantageVertices(adjacency, k=n, convexity=convexity)
 
     if seedsPath:
