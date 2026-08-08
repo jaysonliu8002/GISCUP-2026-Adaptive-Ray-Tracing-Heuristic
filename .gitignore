@@ -5,6 +5,7 @@ __pycache__/
 test/
 *.pyc
 *.log
+*.png
 
 # environments and local tool settings
 .venv/

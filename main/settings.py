@@ -37,7 +37,7 @@ CPU_PROCESSES = None
 # -- problem ----------------------------------------------------------------
 TAUS = [0.25, 0.5, 0.75]
 KS   = [50, 500, 1000]
-GEOJSON_PATH = os.path.join(REPO_ROOT, "GIS-cup-sample-dataset.geojson")
+GEOJSON_PATH = os.path.join(REPO_ROOT, "dataset1_sample.geojson")
 
 # -- radii / viewshed reach --------------------------------------------------
 SOLVE_RADIUS       = 80.0
