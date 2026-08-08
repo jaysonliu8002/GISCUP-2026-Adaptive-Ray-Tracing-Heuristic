@@ -34,10 +34,6 @@ Sample testing instructions:
 
 5.Repeat above steps (including 4) with `"dataset2_sample.geojson"` and `"dataset3_sample.geojson"`
 
-`ADAPTIVE_DOUBLINGS` = 8
-
-5.Repeat above steps (including 4) with `"dataset2_sample.geojson"` and `"dataset3_sample.geojson"`
-
 **PART 2**
 
 TBD
