@@ -25,7 +25,7 @@ from lib_giscup import (
     normalizePolygon, pointOnEdge, computeConvexity, SpatialGrid,
     loadOrBuildPackedViewshed, extraLenFromPacked, baseCovFromPacked,
     buildBuildingToCandidates, buildRefineParallelContext,
-    StaleCacheError,
+    StaleCacheError, datasetDir,
 )
 # matplotlib is imported INSIDE the plotting functions, never at module
 # scope: multiprocessing spawn re-imports this file in every worker, so a
@@ -56,25 +56,51 @@ from settings import (
     VANTAGE_SEED_PERCENT, VANTAGE_RADIUS, VANTAGE_NODE_CAPACITY,
 )
 
-def _submissionPath(n):
-    return os.path.join(SUBMISSION_DIR, f"submission_{n}.txt")
+# ---------------------------------------------------------------------------
+#  PER-DATASET OUTPUT DIRECTORIES
+#
+#  CACHE_DIR and SUBMISSION_DIR are ROOTS; everything a run reads or writes
+#  goes under a per-dataset subdirectory of them (see lib.datasetDir).
+#  Changing GEOJSON_PATH therefore needs no cleanup: the new dataset gets its
+#  own precompute and its own submission_N.txt series, the old dataset's
+#  work stays exactly where it was, and neither can be mistaken for the
+#  other -- not by the cache identity check, and not by the partial-
+#  submission resume below, which used to adopt whatever the previous
+#  dataset happened to leave behind.
+# ---------------------------------------------------------------------------
 
-def nextSubmissionPath():
+def _datasetPaths(polygons=None, create=False):
+    """(cacheDir, submissionDir) for the dataset at GEOJSON_PATH.
+
+    Pass `polygons` when they are already loaded (solve does); otherwise
+    the geojson is read here purely to fingerprint it.
+    """
+    if polygons is None:
+        polygons, _ids = loadGeoJSON(GEOJSON_PATH)
+    return (datasetDir(CACHE_DIR, polygons, GEOJSON_PATH, create=create),
+            datasetDir(SUBMISSION_DIR, polygons, GEOJSON_PATH, create=create))
+
+def _submissionPath(directory, n):
+    return os.path.join(directory, f"submission_{n}.txt")
+
+def nextSubmissionPath(directory=None):
     """First submission_N.txt (N = 1, 2, ...) that doesn't exist yet, so a
     new solve never overwrites an earlier submission."""
+    directory = directory or _datasetPaths(create=True)[1]
     n = 1
-    while os.path.exists(_submissionPath(n)):
+    while os.path.exists(_submissionPath(directory, n)):
         n += 1
-    return _submissionPath(n)
+    return _submissionPath(directory, n)
 
-def latestSubmissionPath():
+def latestSubmissionPath(directory=None):
     """Highest-numbered existing submission_N.txt, or None if there are none."""
+    directory = directory or _datasetPaths()[1]
     n = 1
-    while os.path.exists(_submissionPath(n)):
+    while os.path.exists(_submissionPath(directory, n)):
         n += 1
-    return _submissionPath(n - 1) if n > 1 else None
+    return _submissionPath(directory, n - 1) if n > 1 else None
 
-def _resumableSubmission():
+def _resumableSubmission(directory):
     """
     Where this solve should write, and which subcases are already done.
 
@@ -87,23 +113,28 @@ def _resumableSubmission():
     numbered file, so complete submissions stay protected exactly as
     before.
 
+    `directory` is this DATASET's submission directory, which is what
+    makes "the latest file" unambiguous: a submission left by a run on a
+    different geojson lives somewhere else entirely and can never be
+    adopted here (its antennas and building IDs would be meaningless).
+
     Returns (outPath, doneResults) with doneResults in writeSubmission's
     format.
     """
     expected = {(t, k) for t in TAUS for k in KS}
-    path = latestSubmissionPath()
+    path = latestSubmissionPath(directory)
     if not RESUME_PARTIAL_SUBMISSION or path is None:
-        return nextSubmissionPath(), []
+        return nextSubmissionPath(directory), []
     try:
         subs = parseSubmission(path)
     except Exception:
-        return nextSubmissionPath(), []
+        return nextSubmissionPath(directory), []
     keys = [(s["tau"], s["k"]) for s in subs]
     if len(keys) == len(set(keys)) and 0 < len(keys) and set(keys) < expected:
         done = [{"tau": s["tau"], "k": s["k"], "antennas": s["antennas"],
                  "servicedIds": s["claimedIds"]} for s in subs]
         return path, done
-    return nextSubmissionPath(), []
+    return nextSubmissionPath(directory), []
 
 # ===========================================================================
 #  SHARED VALIDATION HELPER  (used by validate() and solve() so both
@@ -261,7 +292,7 @@ def _shouldSkipCoverageRecheck():
 #  comment for how many seeds each subcase actually asks for.
 # ===========================================================================
 
-def _pickVantageSeeds(polygons, convexity, n=0, radius=VANTAGE_RADIUS,
+def _pickVantageSeeds(polygons, convexity, cacheDir, n=0, radius=VANTAGE_RADIUS,
                       nodeCapacity=VANTAGE_NODE_CAPACITY, verbose=True):
     if n <= 0:
         # Skip building the visibility graph entirely -- no point paying
@@ -279,6 +310,8 @@ def _pickVantageSeeds(polygons, convexity, n=0, radius=VANTAGE_RADIUS,
     # after a crash mid-build picks up from the checkpoint.
     # Cache filenames encode exactly the settings the CONTENTS depend on --
     # here just the radius (plus the seed count, on the seeds file only).
+    # The DATASET is encoded by `cacheDir`, not by the filename, so these
+    # never collide with another geojson's graph (see lib.datasetDir).
     # VANTAGE_NODE_CAPACITY, gridCell and the processing-unit count are
     # performance knobs that cannot change an edge, so they are deliberately
     # absent from both the name and the metadata check (see vantageMeta):
@@ -287,8 +320,8 @@ def _pickVantageSeeds(polygons, convexity, n=0, radius=VANTAGE_RADIUS,
     top = loadOrPickVantageSeeds(
         polygons, candidates, n=n, radius=radius, nodeCapacity=nodeCapacity,
         convexity=convexity, verbose=verbose,
-        seedsPath=os.path.join(CACHE_DIR, f"vantage_seeds_{tag}_n{n}.pkl"),
-        graphPath=os.path.join(CACHE_DIR, f"vantage_graph_{tag}.pkl"),
+        seedsPath=os.path.join(cacheDir, f"vantage_seeds_{tag}_n{n}.pkl"),
+        graphPath=os.path.join(cacheDir, f"vantage_graph_{tag}.pkl"),
         geojsonPath=GEOJSON_PATH)
     if verbose:
         print(f"Vantage seeds ({len(top)}/{n} requested):")
@@ -392,10 +425,19 @@ def solve(seed=0):
     idToIndex = {bid: i for i, bid in enumerate(ids)}
     onAnyBoundary = _timed("_buildBoundaryChecker", _buildBoundaryChecker, polygons)
 
+    # Everything this run reads or writes lives under these two, one pair
+    # per dataset -- so GEOJSON_PATH can change between runs with no
+    # cleanup and nothing of the previous dataset's carried over.
+    cacheDir, submissionDir = _datasetPaths(polygons, create=True)
+    _log(f"dataset: {os.path.basename(GEOJSON_PATH)} "
+         f"({len(polygons)} buildings)")
+    _log(f"  cache      -> {os.path.relpath(cacheDir, REPO_ROOT)}")
+    _log(f"  submissions-> {os.path.relpath(submissionDir, REPO_ROOT)}")
+
     # build once or load from disk (the precompute checkpoints itself to a
     # .partial file every few minutes and resumes from it after a crash;
     # the finished cache is saved to disk BEFORE any solving starts)
-    cacheBase = os.path.join(CACHE_DIR,
+    cacheBase = os.path.join(cacheDir,
                              f"viewcache_r{int(SOLVE_RADIUS)}"
                              + (f"_d{ADAPTIVE_DOUBLINGS}" if _adaptiveMax() else ""))
     candidates, viewCache, perim = _timed(
@@ -435,7 +477,7 @@ def solve(seed=0):
     # Crash safety: pick (or resume) the output file NOW and rewrite it
     # after every verified subcase, so an interruption at any point keeps
     # everything finished so far and the next run continues from there.
-    outPath, doneResults = _resumableSubmission()
+    outPath, doneResults = _resumableSubmission(submissionDir)
     doneKeys = {(r["tau"], r["k"]) for r in doneResults}
     if doneResults:
         _log(f"Resuming partial {os.path.basename(outPath)}: "
@@ -466,7 +508,7 @@ def solve(seed=0):
         poolSize = max(1, int(VANTAGE_SEED_PERCENT * kMax))
         vantageSeedsPool = _timed(
             "_pickVantageSeeds", _pickVantageSeeds,
-            polygons, convexity, n=poolSize, radius=VANTAGE_RADIUS,
+            polygons, convexity, cacheDir, n=poolSize, radius=VANTAGE_RADIUS,
             nodeCapacity=VANTAGE_NODE_CAPACITY)
     else:
         vantageSeedsPool = []
@@ -752,11 +794,17 @@ def plotDataset(outPath=os.path.join(REPO_ROOT, "dataset.png")):
 def plot(usePath=None):
     import matplotlib.pyplot as plt
     plotStart = time.perf_counter()
-    if usePath is None:
-        usePath = latestSubmissionPath()
-        if usePath is None:
-            raise FileNotFoundError(f"no submission_N.txt files in {SUBMISSION_DIR}")
+    # Dataset first: which submissions are even eligible depends on it,
+    # since each dataset keeps its own numbered series.
     polygons, ids = loadGeoJSON(GEOJSON_PATH)
+    if usePath is None:
+        submissionDir = _datasetPaths(polygons)[1]
+        usePath = latestSubmissionPath(submissionDir)
+        if usePath is None:
+            raise FileNotFoundError(
+                f"no submission_N.txt files in {submissionDir} "
+                f"(nothing has been solved for "
+                f"{os.path.basename(GEOJSON_PATH)} yet)")
     subs = parseSubmission(usePath)
  
     allX = [v[0] for p in polygons for v in p]

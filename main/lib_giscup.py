@@ -23,6 +23,8 @@ import math
 import json
 import random
 import os
+import re
+import glob
 import time
 import numpy as np
 from collections import defaultdict
@@ -1690,6 +1692,44 @@ def datasetDiffers(onDisk, want):
     opposed to a setting like radius or seed count. Only this warrants a
     hard stop -- a settings difference is an ordinary rebuild."""
     return (onDisk or {}).get("fingerprint") != (want or {}).get("fingerprint")
+
+
+def datasetDirName(polygons, geojsonPath=None):
+    """The per-dataset subdirectory name: a readable slug plus the short
+    fingerprint that actually decides identity."""
+    stem = os.path.splitext(os.path.basename(geojsonPath or ""))[0]
+    slug = re.sub(r"[^A-Za-z0-9._-]+", "-", stem).strip("-.") or "dataset"
+    return f"{slug}_{_datasetFingerprint(polygons)[:8]}"
+
+
+def datasetDir(root, polygons, geojsonPath=None, create=False):
+    """
+    `root`/<per-dataset subdirectory> -- the mechanism that lets
+    GEOJSON_PATH change with no cleanup and no cross-dataset side effects.
+
+    Cache FILENAMES encode the settings (radius, doublings, seed count) and
+    deliberately not the dataset, so two datasets solved at the same
+    settings used to land on the same path and collide -- one aborting on
+    the other's work (StaleCacheError), or, before that check existed,
+    silently overwriting it. Giving each dataset its own directory removes
+    the collision instead of detecting it: both datasets' precompute
+    coexists, and switching between them is free.
+
+    The FINGERPRINT is the identity; the slug in front of it exists only so
+    the directory is recognizable in a listing. An existing directory
+    carrying this fingerprint is therefore reused whatever its slug says --
+    renaming or moving a .geojson whose geometry is unchanged must not
+    orphan hours of precompute, the same rule that keeps geojsonName in
+    _COSMETIC_META rather than in the comparison.
+    """
+    for existing in sorted(glob.glob(os.path.join(
+            root, f"*_{_datasetFingerprint(polygons)[:8]}"))):
+        if os.path.isdir(existing):
+            return existing
+    path = os.path.join(root, datasetDirName(polygons, geojsonPath))
+    if create:
+        os.makedirs(path, exist_ok=True)
+    return path
 
 
 def _shortPath(path):
