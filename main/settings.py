@@ -37,7 +37,7 @@ CPU_PROCESSES = None
 # -- problem ----------------------------------------------------------------
 TAUS = [0.25, 0.5, 0.75]
 KS   = [50, 500, 1000]
-GEOJSON_PATH = os.path.join(REPO_ROOT, "dataset1_sample.geojson")
+GEOJSON_PATH = os.path.join(REPO_ROOT, "GIS-cup-sample-dataset.geojson")
 # Just change this and re-run -- no cleanup needed. Each dataset gets its
 # own subdirectory of CACHE_DIR and SUBMISSION_DIR (named <file>_<short
 # fingerprint>), so datasets never share a cache or a submission series and
@@ -46,7 +46,7 @@ GEOJSON_PATH = os.path.join(REPO_ROOT, "dataset1_sample.geojson")
 
 # -- radii / viewshed reach --------------------------------------------------
 SOLVE_RADIUS       = 80.0
-ADAPTIVE_DOUBLINGS = 5                     # corridor reach = SOLVE_RADIUS * 2**n; 0/None = off
+ADAPTIVE_DOUBLINGS = 10                     # corridor reach = SOLVE_RADIUS * 2**n; 0/None = off
 SOLVE_GRIDCELL     = SOLVE_RADIUS
 VALIDATION_STEP    = 1.25                  # validation re-sweep reach = claim reach * this;
                                            # > 1 so the re-sweep can both re-check claims
@@ -54,13 +54,13 @@ VALIDATION_STEP    = 1.25                  # validation re-sweep reach = claim r
 
 # -- main strategy ------------------------------------------------------------
 LOOKAHEAD_GREEDY       = True             # chess-style placement search (see README)
-LOOKAHEAD_BEAM         = 5                 # candidates given the deep evaluation per step
+LOOKAHEAD_BEAM         = 10                 # candidates given the deep evaluation per step
 LOOKAHEAD_DEPTH_BY_TAU = {0.25: 1, 0.5: 2, 0.75: 3}   # tau -> ply gradient; None = fixed
-LOOKAHEAD_DEPTH        = 2                 # used when the gradient is None
+LOOKAHEAD_DEPTH        = 4                 # used when the gradient is None
 
 # -- refinement ---------------------------------------------------------------
 REFINE_WITH_SWAPS     = True
-REFINE_MAX_ITERATIONS = 10000               # cap on COMMITTED swaps
+REFINE_MAX_ITERATIONS = 99999               # cap on COMMITTED swaps
 REFINE_TIME_BUDGET    = 3600                # seconds per subcase; None = unlimited
 REFINE_VERBOSE        = True
                                            # the swap scan's worker count is NOT a
@@ -82,7 +82,7 @@ CLAIM_MARGIN = 1e-6      # search, claim, and validate at tau + this, keeping
 
 # -- vantage seeding (centrality_giscup.py) ------------------------------------
 VANTAGE_SEED_PERCENT  = 0.01               # 0 = off (enables the faster slicing path)
-VANTAGE_RADIUS        = 1280.0
+VANTAGE_RADIUS        = 10240.0
 VANTAGE_NODE_CAPACITY = 25
                                            # worker count: see the REFINE note above --
                                            # CPU_PROCESSES.
