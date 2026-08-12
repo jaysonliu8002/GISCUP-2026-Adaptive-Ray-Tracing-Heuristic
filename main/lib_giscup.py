@@ -112,10 +112,15 @@ def loadGeoJSON(path):
         geom = feat["geometry"]
         gtype = geom["type"]
 
-        # Resolve a building ID: top-level "id", else properties.id, else index
-        bid = feat.get("id")
+        # Resolve a building ID: properties.id, else top-level "id", else index.
+        # properties.id MUST win — the contest evaluator reads only
+        # properties.id (dataset-loader.ts: prepareBuilding), so preferring a
+        # top-level "id" would make every claim an UNKNOWN_CLAIM and score 0
+        # on any dataset that carries both.
+        props = feat.get("properties") or {}
+        bid = props.get("id")
         if bid is None:
-            bid = feat.get("properties", {}).get("id", idx)
+            bid = feat.get("id", idx)
 
         if gtype == "Polygon":
             ring = geom["coordinates"][0]                      # outer ring
@@ -165,7 +170,10 @@ def writeSubmission(path, results):
         os.makedirs(dirName, exist_ok=True)
     fd, tmpPath = tempfile.mkstemp(dir=dirName or ".", suffix=".tmp")
     try:
-        with os.fdopen(fd, "w") as f:
+        # newline="\n": keep the file LF-only on Windows too. The official
+        # evaluator normalizes CRLF, but the reference submissions are LF and
+        # there is no reason to hand the graders a platform quirk to absorb.
+        with os.fdopen(fd, "w", newline="\n") as f:
             for r in results:
                 f.write(f"({r['tau']!r}, {r['k']})\n")
                 f.write(", ".join(formatCoord(x, y) for x, y in r["antennas"]) + "\n")
