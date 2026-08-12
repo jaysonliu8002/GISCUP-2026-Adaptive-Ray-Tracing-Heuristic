@@ -55,8 +55,8 @@ VALIDATION_STEP    = 1.25                  # validation re-sweep reach = claim r
 # -- main strategy ------------------------------------------------------------
 LOOKAHEAD_GREEDY       = True             # chess-style placement search (see README)
 LOOKAHEAD_BEAM         = 10                 # candidates given the deep evaluation per step
-LOOKAHEAD_DEPTH_BY_TAU = {0.25: 1, 0.5: 2, 0.75: 3}   # tau -> ply gradient; None = fixed
-LOOKAHEAD_DEPTH        = 4                 # used when the gradient is None
+LOOKAHEAD_DEPTH_BY_TAU = {TAUS[0]: 1, TAUS[1]: 2, TAUS[2]: 3}   # tau -> ply gradient; None = fixed
+LOOKAHEAD_DEPTH        = 2                 # used when the gradient is None
 
 # -- refinement ---------------------------------------------------------------
 REFINE_WITH_SWAPS     = True
@@ -82,7 +82,7 @@ CLAIM_MARGIN = 1e-6      # search, claim, and validate at tau + this, keeping
 
 # -- vantage seeding (centrality_giscup.py) ------------------------------------
 VANTAGE_SEED_PERCENT  = 0.01               # 0 = off (enables the faster slicing path)
-VANTAGE_RADIUS        = 10240.0
+VANTAGE_RADIUS        = 5120.0
 VANTAGE_NODE_CAPACITY = 25
                                            # worker count: see the REFINE note above --
                                            # CPU_PROCESSES.
