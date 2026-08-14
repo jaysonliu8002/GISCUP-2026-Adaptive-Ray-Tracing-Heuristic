@@ -36,8 +36,8 @@ CPU_PROCESSES = None
 
 # -- problem ----------------------------------------------------------------
 TAUS = [0.25, 0.5, 0.75]
-KS   = [50, 500, 1000]
-GEOJSON_PATH = os.path.join(REPO_ROOT, "GIS-cup-sample-dataset.geojson")
+KS   = [100, 1000, 2500]
+GEOJSON_PATH = os.path.join(REPO_ROOT, "giscup-dataset-practice.geojson")
 # Just change this and re-run -- no cleanup needed. Each dataset gets its
 # own subdirectory of CACHE_DIR and SUBMISSION_DIR (named <file>_<short
 # fingerprint>), so datasets never share a cache or a submission series and
@@ -46,7 +46,7 @@ GEOJSON_PATH = os.path.join(REPO_ROOT, "GIS-cup-sample-dataset.geojson")
 
 # -- radii / viewshed reach --------------------------------------------------
 SOLVE_RADIUS       = 80.0
-ADAPTIVE_DOUBLINGS = 10                     # corridor reach = SOLVE_RADIUS * 2**n; 0/None = off
+ADAPTIVE_DOUBLINGS = 7                     # corridor reach = SOLVE_RADIUS * 2**n; 0/None = off
 SOLVE_GRIDCELL     = SOLVE_RADIUS
 VALIDATION_STEP    = 1.25                  # validation re-sweep reach = claim reach * this;
                                            # > 1 so the re-sweep can both re-check claims
@@ -82,7 +82,7 @@ CLAIM_MARGIN = 1e-6      # search, claim, and validate at tau + this, keeping
 
 # -- vantage seeding (centrality_giscup.py) ------------------------------------
 VANTAGE_SEED_PERCENT  = 0.01               # 0 = off (enables the faster slicing path)
-VANTAGE_RADIUS        = 5120.0
+VANTAGE_RADIUS        = 10240.0
 VANTAGE_NODE_CAPACITY = 25
                                            # worker count: see the REFINE note above --
                                            # CPU_PROCESSES.

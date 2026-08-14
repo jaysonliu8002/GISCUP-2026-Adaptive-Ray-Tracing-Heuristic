@@ -865,17 +865,17 @@ if __name__ == "__main__":
     mainStart = time.perf_counter()
 
     print(f"Start: {datetime.now()}")
-
-    try:
-        solve()
-    except StaleCacheError as e:
-        # cache/ holds another dataset's work. Reported as a plain message
-        # rather than a traceback: the stack is noise here, the two dataset
-        # names and the rm line are the whole content. Nothing was written.
-        sys.stdout.flush()      # so the abort lands after the progress log,
-                                # not ahead of it, when output is redirected
-        print(f"\nERROR: {e}", file=sys.stderr)
-        raise SystemExit(1)
-    print(f"Solved: {datetime.now()}")
+    plotDataset()
+    # try:
+    #     solve()
+    # except StaleCacheError as e:
+    #     # cache/ holds another dataset's work. Reported as a plain message
+    #     # rather than a traceback: the stack is noise here, the two dataset
+    #     # names and the rm line are the whole content. Nothing was written.
+    #     sys.stdout.flush()      # so the abort lands after the progress log,
+    #                             # not ahead of it, when output is redirected
+    #     print(f"\nERROR: {e}", file=sys.stderr)
+    #     raise SystemExit(1)
+    # print(f"Solved: {datetime.now()}")
 
     print(f"[__main__ total] took {time.perf_counter() - mainStart:.2f}s")
