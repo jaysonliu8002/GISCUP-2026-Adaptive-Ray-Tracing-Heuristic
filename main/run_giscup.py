@@ -876,6 +876,6 @@ if __name__ == "__main__":
                                 # not ahead of it, when output is redirected
         print(f"\nERROR: {e}", file=sys.stderr)
         raise SystemExit(1)
-    # print(f"Solved: {datetime.now()}")
+    print(f"Solved: {datetime.now()}")
 
     print(f"[__main__ total] took {time.perf_counter() - mainStart:.2f}s")
