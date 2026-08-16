@@ -80,7 +80,7 @@ GEOJSON_PATH = os.path.join(REPO_ROOT, "GIS-cup-competition-dataset.geojson")
 SOLVE_RADIUS       = 80.0
 ADAPTIVE_DOUBLINGS = 8                     # corridor reach = SOLVE_RADIUS * 2**n; 0/None = off
 SOLVE_GRIDCELL     = SOLVE_RADIUS
-VALIDATION_STEP    = 1.25                  # validation re-sweep reach = claim reach * this;
+VALIDATION_STEP    = 1                  # validation re-sweep reach = claim reach * this;
                                            # > 1 so the re-sweep can both re-check claims
                                            # independently AND harvest extra true ones
 
@@ -114,7 +114,7 @@ CLAIM_MARGIN = 1e-6      # search, claim, and validate at tau + this, keeping
 
 # -- vantage seeding (centrality_giscup.py) ------------------------------------
 VANTAGE_SEED_PERCENT  = 0.01               # 0 = off (enables the faster slicing path)
-VANTAGE_RADIUS        = 1280.0
+VANTAGE_RADIUS        = 2560.0
 VANTAGE_NODE_CAPACITY = 25
                                            # worker count: see the REFINE note above --
                                            # CPU_PROCESSES.
