@@ -82,7 +82,7 @@ CLAIM_MARGIN = 1e-6      # search, claim, and validate at tau + this, keeping
 
 # -- vantage seeding (centrality_giscup.py) ------------------------------------
 VANTAGE_SEED_PERCENT  = 0.01               # 0 = off (enables the faster slicing path)
-VANTAGE_RADIUS        = 2560.0
+VANTAGE_RADIUS        = 1280.0
 VANTAGE_NODE_CAPACITY = 25
                                            # worker count: see the REFINE note above --
                                            # CPU_PROCESSES.
